@@ -78,17 +78,16 @@ The operand IS the next byte in the instruction stream. No memory lookup needed.
 ```
 LDA #$42  →  opcode: 0xA9, operand: 0x42  (2 bytes total)
 
-PC before: 0x0200
-Memory:    [0x0200]=0xA9  [0x0201]=0x42
+Memory:  [0x0200]=0xA9  [0x0201]=0x42
 
-imm() sets addr_abs = 0x0200, pc becomes 0x0201
-LDA then reads from addr_abs (0x0200) → gets 0x42 → loads into A
-
-Wait — imm sets addr_abs = pc BEFORE incrementing. So:
-  addr_abs = 0x0201 (the operand byte), pc becomes 0x0202
+clock() reads opcode 0xA9 from 0x0200, increments PC → PC = 0x0201
+imm() is called: addr_abs = 0x0201, PC++ → PC = 0x0202
+LDA reads from addr_abs (0x0201) → gets 0x42 → loads into A
 ```
 
-Actually: `addr_abs = pc; pc++` — addr_abs points at the operand byte, then pc skips past it.
+The key: `clock()` always increments PC past the opcode byte before calling the
+addressing mode. So when `imm()` runs, PC already points at the operand byte.
+`imm()` captures that address then advances PC past it.
 
 ---
 
@@ -166,10 +165,12 @@ Full 16-bit address in the next two bytes, little-endian (low byte first).
 ```
 LDA $1234  →  opcode: 0xAD, lo: 0x34, hi: 0x12  (3 bytes total)
 
-Memory at PC:  [0x0200]=0xAD  [0x0201]=0x34  [0x0202]=0x12
-abs() reads:   lo = 0x34, hi = 0x12
+Memory:  [0x0200]=0xAD  [0x0201]=0x34  [0x0202]=0x12
+
+clock() reads opcode 0xAD from 0x0200, PC → 0x0201
+abs() reads lo = 0x34 from 0x0201, PC → 0x0202
+abs() reads hi = 0x12 from 0x0202, PC → 0x0203
 addr_abs = (0x12 << 8) | 0x34 = 0x1234
-PC advances to 0x0203
 ```
 
 Little-endian is the native byte order of the 6502.
@@ -224,10 +225,11 @@ JMP jumps to 0x5678
 ```
 Pointer address: 0x30FF
 [0x30FF] = 0x80  ← low byte of target
-[0x3100] = 0x50  ← what you'd expect (WRONG on real hardware)
-[0x3000] = 0x50  ← what the chip actually reads (the bug)
+[0x3100] = 0x60  ← high byte you'd expect (correct behaviour)
+[0x3000] = 0x50  ← high byte the chip actually reads (the bug — wraps in page)
 
-Result: addr_abs = 0x5080 (not 0x5050)
+Correct behaviour:  addr_abs = (0x60 << 8) | 0x80 = 0x6080
+Real hardware (bug): addr_abs = (0x50 << 8) | 0x80 = 0x5080
 ```
 
 Some NES games accidentally rely on this bug. We must emulate it exactly.
