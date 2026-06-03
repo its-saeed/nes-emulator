@@ -1,3 +1,9 @@
+use crate::bus::Bus;
+
+const NMI_VECTOR: u16 = 0xFFFA;
+const RESET_VECTOR: u16 = 0xFFFC;
+const IRQ_VECTOR: u16 = 0xFFFE;
+
 #[repr(u8)]
 pub enum Flag {
     C = 1 << 0, // Carry
@@ -10,19 +16,57 @@ pub enum Flag {
     N = 1 << 7, // Negative
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct Stack {
+    ptr: u8,
+}
+
+impl Default for Stack {
+    fn default() -> Self {
+        Self { ptr: 0xfd }
+    }
+}
+
+impl Stack {
+    const BASE: u16 = 0x0100;
+
+    fn reset(&mut self) {
+        self.ptr = 0xfd;
+    }
+
+    pub fn push(&mut self, data: u8, bus: &mut Bus) {
+        bus.write(Self::BASE + self.ptr as u16, data);
+        self.ptr = self.ptr.wrapping_sub(1);
+    }
+
+    pub fn pop(&mut self, bus: &mut Bus) -> u8 {
+        self.ptr = self.ptr.wrapping_add(1);
+        bus.read(Self::BASE + self.ptr as u16)
+    }
+}
+
+#[derive(Copy, Clone)]
+pub struct Instruction {
+    pub name: &'static str,
+    pub operate: fn(&mut Cpu, &mut Bus) -> u8,
+    pub addr_mode: fn(&mut Cpu, &mut Bus) -> u8,
+    pub cycles: u8,
+}
+
 pub struct Cpu {
     pub a: u8,
     pub x: u8,
     pub y: u8,
-    pub stack_ptr: u8,
     pub pc: u16,
     pub status: u8,
+    pub stack: Stack,
 
     fetched: u8,
     addr_abs: u16,
     addr_rel: u16,
     opcode: u8,
     cycles: u8,
+    lookup: [Instruction; 256],
 }
 
 impl Cpu {
@@ -31,27 +75,1327 @@ impl Cpu {
             a: 0,
             x: 0,
             y: 0,
-            stack_ptr: 0,
-            pc: 0,
             status: Flag::U as u8,
             fetched: 0,
             addr_abs: 0,
             addr_rel: 0,
             opcode: 0,
             cycles: 0,
+            lookup: build_lookup(),
+            pc: 0,
+            stack: Default::default(),
         }
     }
 
+    // The status register packs 8 independent flags into one byte. Rather than
+    // scattering raw bit masks through every opcode, these two helpers let all
+    // flag reads and writes go through a single named interface.
     pub fn get_flag(&self, f: Flag) -> bool {
         self.status & (f as u8) != 0
     }
 
-    pub fn set_flag(&mut self, f: Flag, v: bool) {
+    pub fn set_flag(&mut self, f: Flag, v: bool) -> &mut Self {
         let mask = f as u8;
         if v {
             self.status |= mask;
         } else {
             self.status &= !mask;
         }
+        self
     }
+
+    fn pc_read(&mut self, bus: &Bus) -> u8 {
+        let value = bus.read(self.pc);
+        self.pc = self.pc.wrapping_add(1);
+        value
+    }
+
+    fn pc_advance(&mut self) -> u16 {
+        let prev = self.pc;
+        self.pc = self.pc.wrapping_add(1);
+        prev
+    }
+
+    // The CPU never touches memory directly — everything goes through the bus.
+    // These thin delegates keep opcode code readable and hide the bus parameter.
+    fn read(&self, bus: &Bus, addr: u16) -> u8 {
+        bus.read(addr)
+    }
+
+    fn write(&self, bus: &mut Bus, addr: u16, data: u8) {
+        bus.write(addr, data);
+    }
+
+    // The 6502 has no defined power-on state. reset() is how the CPU gets its
+    // bearings: it reads a start address from a known ROM location (the reset
+    // vector at 0xFFFC) and jumps there. Every NES game begins here.
+    pub fn reset(&mut self, bus: &mut Bus) {
+        // 1. Read the 16-bit reset vector from 0xFFFC (lo) and 0xFFFD (hi), set pc to it
+        // 2. Reset a, x, y to 0
+        // 3. Set stack_ptr to 0xFD
+        // 4. Set status to U flag only (all others clear)
+        // 5. Clear addr_abs, addr_rel, fetched to 0
+        // 6. Set cycles = 8 (reset takes time)
+
+        self.pc = bus.read_u16(RESET_VECTOR);
+
+        self.a = 0;
+        self.x = 0;
+        self.y = 0;
+        self.stack.reset();
+        self.status = Flag::U as u8;
+        self.addr_abs = 0;
+        self.addr_rel = 0;
+        self.fetched = 0;
+        self.cycles = 8;
+    }
+
+    // Hardware devices (cartridges, mappers) signal the CPU by asserting the IRQ
+    // line. The CPU saves its current position and status on the stack, then jumps
+    // to a handler routine. Because it's maskable, games can suppress it during
+    // critical sections by setting the I flag.
+    pub fn irq(&mut self, bus: &mut Bus) {
+        // Only execute if the I (interrupt disable) flag is clear
+        //
+        // 1. Push pc high byte to stack: write to 0x0100 + stack_ptr, then stack_ptr--
+        // 2. Push pc low byte to stack: write to 0x0100 + stack_ptr, then stack_ptr--
+        // 3. Set flags: B = 0, U = 1, I = 1
+        // 4. Push status to stack: write to 0x0100 + stack_ptr, then stack_ptr--
+        // 5. Read new pc from IRQ vector: lo from 0xFFFE, hi from 0xFFFF
+        // 6. Set cycles = 7
+        if self.get_flag(Flag::I) {
+            return;
+        }
+        self.stack.push((self.pc >> 8) as u8, bus);
+        self.stack.push((self.pc & 0xFF) as u8, bus);
+        self.set_flag(Flag::B, false)
+            .set_flag(Flag::U, true)
+            .set_flag(Flag::I, true);
+
+        self.stack.push(self.status, bus);
+        self.pc = bus.read_u16(IRQ_VECTOR);
+        self.cycles = 7;
+    }
+
+    // The PPU fires an NMI at the start of every vertical blank (~60 times/sec).
+    // Because it cannot be masked by the I flag, it is the reliable heartbeat
+    // games use to synchronize all CPU-side work — AI, input, sound — with the
+    // screen. Miss it and the game tears or lags.
+    pub fn nmi(&mut self, bus: &mut Bus) {
+        // Same as irq() but: always fires (no I flag check), reads vector from 0xFFFA/0xFFFB,
+        // and takes 8 cycles instead of 7
+        //
+        // 1. Push pc high byte to stack, stack_ptr--
+        // 2. Push pc low byte to stack, stack_ptr--
+        // 3. Set flags: B = 0, U = 1, I = 1
+        // 4. Push status to stack, stack_ptr--
+        // 5. Read new pc: lo from 0xFFFA, hi from 0xFFFB
+        // 6. Set cycles = 8
+        self.stack.push((self.pc >> 8) as u8, bus);
+        self.stack.push((self.pc & 0xFF) as u8, bus);
+        self.set_flag(Flag::B, false)
+            .set_flag(Flag::U, true)
+            .set_flag(Flag::I, true);
+
+        self.stack.push(self.status, bus);
+        self.pc = bus.read_u16(NMI_VECTOR);
+        self.cycles = 8;
+    }
+
+    // The top-level driver of the CPU. The NES master clock calls this every
+    // tick. Most instructions take 2–7 cycles; clock() executes the full
+    // instruction in one shot but then idles for the remaining cycles so that
+    // timing-sensitive devices (especially the PPU, which runs 3 cycles per CPU
+    // cycle) stay in sync.
+    pub fn clock(&mut self, bus: &mut Bus) {
+        // If cycles == 0, the previous instruction is done — execute the next one:
+        //   1. Set U flag
+        //   2. Read opcode byte from pc, increment pc
+        //   3. Set cycles = lookup[opcode].cycles
+        //   4. Call the addressing mode fn, capture its return value (extra_cycle1)
+        //   5. Call the opcode operate fn, capture its return value (extra_cycle2)
+        //   6. cycles += extra_cycle1 & extra_cycle2  (& not +, both must agree)
+        //   7. Set U flag again
+        //
+        // Always at the end (regardless of cycles): cycles--
+        if self.cycles == 0 {
+            self.set_flag(Flag::U, true);
+            self.opcode = self.pc_read(bus);
+            let instruction = self.lookup[self.opcode as usize];
+            self.cycles = instruction.cycles;
+            let addr_mode_cycles = (instruction.addr_mode)(self, bus);
+            let operate_cycles = (instruction.operate)(self, bus);
+            self.cycles += operate_cycles & addr_mode_cycles;
+            self.set_flag(Flag::U, true);
+        }
+        self.cycles -= 1;
+    }
+
+    // Before an opcode does its arithmetic it needs one byte of input data.
+    // fetch() provides that byte from wherever the addressing mode resolved:
+    // either already in `fetched` (implied mode set it), or read from addr_abs.
+    // Opcodes call this instead of reading memory directly so the implied-mode
+    // special case stays in one place.
+    fn fetch(&mut self, bus: &mut Bus) -> u8 {
+        // If the current instruction's addr_mode is NOT imp, read from addr_abs into fetched.
+        // If it IS imp, fetched was already set by imp() — don't read from memory.
+        // Return fetched either way.
+        //
+        // Compare: self.lookup[self.opcode as usize].addr_mode != Cpu::imp
+        if !std::ptr::fn_addr_eq(
+            self.lookup[self.opcode as usize].addr_mode,
+            Cpu::imp as fn(&mut Cpu, &mut Bus) -> u8,
+        ) {
+            self.fetched = bus.read(self.addr_abs)
+        };
+        self.fetched
+    }
+}
+
+impl Cpu {
+    // Instructions like CLC or INX act on a register and need no memory address.
+    // We still capture A into fetched so that accumulator-targeting instructions
+    // (like ASL in accumulator mode) have a value to work with without special-casing.
+    fn imp(&mut self, _bus: &mut Bus) -> u8 {
+        // Capture accumulator into fetched (some implied instructions like PHA need it)
+        // Return 0
+        self.fetched = self.a;
+        0
+    }
+
+    // The value to operate on is baked directly into the instruction — no memory
+    // lookup needed. The cheapest and most common way to supply a constant.
+    // e.g. LDA #$42 loads the literal value 0x42 into A.
+    fn imm(&mut self, _bus: &mut Bus) -> u8 {
+        // The operand is the next byte in the instruction stream.
+        // Set addr_abs = pc, then pc++
+        // Return 0
+        self.addr_abs = self.pc_advance();
+        0
+    }
+
+    // Zero page (0x0000–0x00FF) is the 6502's "fast RAM". A 1-byte address
+    // instead of 2 means shorter, faster instructions. Games store their most
+    // frequently accessed variables — counters, flags, pointers — here.
+    fn zp0(&mut self, bus: &mut Bus) -> u8 {
+        // Read one byte from pc as an 8-bit zero-page address, pc++
+        // Mask to 0x00FF to stay in page zero
+        // Set addr_abs, return 0
+        self.addr_abs = self.pc_read(bus) as u16 & 0x00FF;
+        0
+    }
+
+    // Zero page indexed: X acts as an array index into a small table in zero page.
+    // The result wraps within zero page (never escapes 0x00FF), which is intentional
+    // — it keeps the access fast and predictable.
+    fn zpx(&mut self, bus: &mut Bus) -> u8 {
+        // Same as zp0 but add x register to the address before masking
+        // addr_abs = (read(pc) + x) & 0x00FF, pc++
+        // Return 0
+        self.addr_abs = (self.pc_read(bus) as u16 + self.x as u16) as u16 & 0x00FF;
+        0
+    }
+
+    // Same idea as zpx but using Y. Mainly used with LDX/STX, which don't
+    // support zpx — the instruction set isn't fully orthogonal.
+    fn zpy(&mut self, bus: &mut Bus) -> u8 {
+        // Same as zpx but add y register
+        // addr_abs = (read(pc) + y) & 0x00FF, pc++
+        // Return 0
+        self.addr_abs = (self.pc_read(bus) as u16 + self.y as u16) as u16 & 0x00FF;
+        0
+    }
+
+    // Used exclusively by branch instructions (BEQ, BNE, BCC, etc.). Instead of
+    // a full 16-bit target address, a signed 8-bit offset keeps branch instructions
+    // compact (2 bytes). The range of ±128 bytes is enough for nearly all loops
+    // and conditionals.
+    fn rel(&mut self, bus: &mut Bus) -> u8 {
+        // Read one byte from pc as a signed relative offset, pc++
+        // Store in addr_rel
+        // If bit 7 is set (negative number), sign-extend: addr_rel |= 0xFF00
+        // Return 0
+        self.addr_rel = self.pc_read(bus) as i8 as u16;
+        0
+    }
+
+    // The general-purpose addressing mode: reach any byte in the full 64KB space.
+    // Most ROM reads, MMIO device accesses (PPU registers at 0x2000, APU at 0x4000),
+    // and cartridge data use absolute addressing.
+    fn abs(&mut self, bus: &mut Bus) -> u8 {
+        // Read a full 16-bit address, little-endian:
+        //   lo = read(pc), pc++
+        //   hi = read(pc), pc++
+        //   addr_abs = (hi << 8) | lo
+        // Return 0
+        let low = self.pc_read(bus) as u16;
+        let high = self.pc_read(bus) as u16;
+        self.addr_abs = (high << 8) | low;
+        0
+    }
+
+    // The workhorse for iterating through arrays anywhere in memory: X is the
+    // loop counter, the base address is the array start. Crossing a page boundary
+    // (high byte of address changes) costs an extra cycle because the real hardware
+    // needs an extra internal cycle to carry the addition.
+    fn abx(&mut self, bus: &mut Bus) -> u8 {
+        // Same as abs, then add x to addr_abs
+        // If the addition changes the high byte (page boundary crossed), return 1
+        // Otherwise return 0
+        let low = self.pc_read(bus) as u16;
+        let high = self.pc_read(bus) as u16;
+        self.addr_abs = (high << 8) | low;
+
+        let base_page = self.addr_abs & 0xFF00;
+        self.addr_abs = self.addr_abs.wrapping_add(self.x as u16);
+
+        if (self.addr_abs & 0xFF00) != base_page {
+            1
+        } else {
+            0
+        }
+    }
+
+    // Same as abx but uses Y. Commonly paired with izy: use a zero-page pointer
+    // to find the base of an array, then aby/Y to walk through it.
+    fn aby(&mut self, bus: &mut Bus) -> u8 {
+        // Same as abx but add y instead of x
+        let low = self.pc_read(bus) as u16;
+        let high = self.pc_read(bus) as u16;
+        self.addr_abs = (high << 8) | low;
+
+        let base_page = self.addr_abs & 0xFF00;
+        self.addr_abs = self.addr_abs.wrapping_add(self.y as u16);
+
+        if (self.addr_abs & 0xFF00) != base_page {
+            1
+        } else {
+            0
+        }
+    }
+
+    // The 6502's only true pointer dereference — used almost exclusively by JMP
+    // to implement jump tables and dynamic dispatch. Contains a famous hardware
+    // bug: a pointer ending in 0xFF wraps its high-byte read within the same page
+    // instead of crossing to the next. Some NES games depend on this bug.
+    fn ind(&mut self, bus: &mut Bus) -> u8 {
+        // Read a 16-bit pointer address from pc (little-endian), pc += 2
+        // Then read the actual 16-bit address from that pointer
+        //
+        // Hardware bug: if the pointer's low byte is 0xFF, the high byte of the
+        // target address wraps within the same page instead of crossing to the next:
+        //   if ptr_lo == 0xFF:
+        //     hi = read(ptr & 0xFF00)   <- wraps to start of same page
+        //   else:
+        //     hi = read(ptr + 1)        <- normal
+        // Return 0
+
+        let ptr_lo = self.pc_read(bus) as u16;
+        let ptr_hi = self.pc_read(bus) as u16;
+        let ptr = (ptr_hi << 8) | ptr_lo;
+
+        let lo = bus.read(ptr) as u16;
+        let hi = if ptr_lo == 0xFF {
+            bus.read(ptr & 0xFF00) as u16 // hardware bug: wraps within same page
+        } else {
+            bus.read(ptr + 1) as u16
+        };
+
+        self.addr_abs = (hi << 8) | lo;
+        0
+    }
+
+    // X selects a pointer from a table of 16-bit pointers stored in zero page,
+    // then dereferences it. Useful when you have multiple data structures and need
+    // to pick one by index — e.g. a table of enemy attribute pointers, select by X.
+    fn izx(&mut self, bus: &mut Bus) -> u8 {
+        // Read one byte from pc as a zero-page base address, pc++
+        // Add x to get a zero-page pointer address (mask to 0x00FF)
+        // Read the 16-bit actual address from that pointer (lo, hi — both masked to 0x00FF)
+        // addr_abs = (hi << 8) | lo
+        // Return 0
+        let base = ((self.pc_read(bus) as u16) + self.x as u16) & 0x00FF;
+        let low = bus.read(base) as u16;
+        let high = bus.read((base + 1) & 0x00FF) as u16;
+        self.addr_abs = (high << 8) | low;
+
+        0
+    }
+
+    // Follows a fixed zero-page pointer to a base address, then uses Y as an
+    // array offset. The natural pattern for "I have a pointer to a buffer, walk
+    // through it with Y" — the most common indirect mode in NES games.
+    fn izy(&mut self, bus: &mut Bus) -> u8 {
+        // Read one byte from pc as a zero-page pointer address, pc++
+        // Read 16-bit base address from zero page (lo at addr, hi at addr+1, both masked)
+        // Add y to get the final addr_abs
+        // If y addition crosses a page boundary, return 1; otherwise return 0
+        let base = self.pc_read(bus) as u16;
+        let low = bus.read(base) as u16;
+        let high = bus.read((base + 1) & 0x00FF) as u16;
+        let addr = (high << 8) | low;
+        self.addr_abs = addr.wrapping_add(self.y as u16);
+        if self.addr_abs & 0xFF00 != addr & 0xFF00 {
+            1
+        } else {
+            0
+        }
+    }
+}
+
+// Opcodes — all stubbed, implemented in later steps
+impl Cpu {
+    fn xxx(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    } // illegal/unknown opcode
+    fn nop(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn adc(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn and(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn asl(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn bcc(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn bcs(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn beq(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn bit(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn bmi(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn bne(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn bpl(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn brk(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn bvc(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn bvs(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn clc(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn cld(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn cli(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn clv(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn cmp(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn cpx(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn cpy(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn dec(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn dex(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn dey(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn eor(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn inc(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn inx(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn iny(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn jmp(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn jsr(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn lda(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn ldx(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn ldy(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn lsr(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn ora(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn pha(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn php(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn pla(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn plp(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn rol(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn ror(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn rti(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn rts(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn sbc(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn sec(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn sed(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn sei(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn sta(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn stx(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn sty(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn tax(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn tay(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn tsx(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn txa(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn txs(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+    fn tya(&mut self, _bus: &mut Bus) -> u8 {
+        0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::bus::Bus;
+
+    fn make() -> (Cpu, Bus) {
+        (Cpu::new(), Bus::new())
+    }
+
+    fn setup(pc: u16, mem: &[(u16, u8)]) -> (Cpu, Bus) {
+        let (mut cpu, mut bus) = make();
+        cpu.pc = pc;
+        for &(addr, val) in mem {
+            bus.write(addr, val);
+        }
+        (cpu, bus)
+    }
+
+    // --- reset ---
+
+    #[test]
+    fn reset_loads_pc_from_reset_vector() {
+        let (mut cpu, mut bus) = make();
+        bus.write(0xFFFC, 0x00);
+        bus.write(0xFFFD, 0x80);
+        cpu.reset(&mut bus);
+        assert_eq!(cpu.pc, 0x8000);
+    }
+
+    #[test]
+    fn reset_clears_registers() {
+        let (mut cpu, mut bus) = make();
+        cpu.a = 0xFF;
+        cpu.x = 0xFF;
+        cpu.y = 0xFF;
+        bus.write(0xFFFC, 0x00);
+        bus.write(0xFFFD, 0x80);
+        cpu.reset(&mut bus);
+        assert_eq!(cpu.a, 0);
+        assert_eq!(cpu.x, 0);
+        assert_eq!(cpu.y, 0);
+    }
+
+    #[test]
+    fn reset_sets_stack_ptr_to_fd() {
+        let (mut cpu, mut bus) = make();
+        bus.write(0xFFFC, 0x00);
+        bus.write(0xFFFD, 0x80);
+        cpu.reset(&mut bus);
+        assert_eq!(cpu.stack.ptr, 0xFD);
+    }
+
+    #[test]
+    fn reset_sets_u_flag_only() {
+        let (mut cpu, mut bus) = make();
+        bus.write(0xFFFC, 0x00);
+        bus.write(0xFFFD, 0x80);
+        cpu.reset(&mut bus);
+        assert_eq!(cpu.status, Flag::U as u8);
+    }
+
+    #[test]
+    fn reset_takes_8_cycles() {
+        let (mut cpu, mut bus) = make();
+        cpu.reset(&mut bus);
+        assert_eq!(cpu.cycles, 8);
+    }
+
+    // --- irq ---
+
+    #[test]
+    fn irq_does_nothing_when_interrupt_disabled() {
+        let (mut cpu, mut bus) = make();
+        bus.write(0xFFFC, 0x00);
+        bus.write(0xFFFD, 0x80);
+        cpu.reset(&mut bus);
+        cpu.set_flag(Flag::I, true);
+        let pc_before = cpu.pc;
+        let sp_before = cpu.stack.ptr;
+        cpu.irq(&mut bus);
+        assert_eq!(cpu.pc, pc_before);
+        assert_eq!(cpu.stack.ptr, sp_before);
+    }
+
+    #[test]
+    fn irq_jumps_to_irq_vector() {
+        let (mut cpu, mut bus) = make();
+        bus.write(0xFFFC, 0x00);
+        bus.write(0xFFFD, 0x80);
+        cpu.reset(&mut bus);
+        cpu.set_flag(Flag::I, false);
+        bus.write(0xFFFE, 0x00);
+        bus.write(0xFFFF, 0x90);
+        cpu.irq(&mut bus);
+        assert_eq!(cpu.pc, 0x9000);
+    }
+
+    #[test]
+    fn irq_pushes_three_bytes_to_stack() {
+        let (mut cpu, mut bus) = make();
+        bus.write(0xFFFC, 0x00);
+        bus.write(0xFFFD, 0x80);
+        cpu.reset(&mut bus);
+        cpu.set_flag(Flag::I, false);
+        let sp_before = cpu.stack.ptr;
+        cpu.irq(&mut bus);
+        assert_eq!(cpu.stack.ptr, sp_before.wrapping_sub(3));
+    }
+
+    #[test]
+    fn irq_takes_7_cycles() {
+        let (mut cpu, mut bus) = make();
+        bus.write(0xFFFC, 0x00);
+        bus.write(0xFFFD, 0x80);
+        cpu.reset(&mut bus);
+        cpu.set_flag(Flag::I, false);
+        cpu.irq(&mut bus);
+        assert_eq!(cpu.cycles, 7);
+    }
+
+    // --- nmi ---
+
+    #[test]
+    fn nmi_fires_even_when_interrupt_disabled() {
+        let (mut cpu, mut bus) = make();
+        bus.write(0xFFFC, 0x00);
+        bus.write(0xFFFD, 0x80);
+        cpu.reset(&mut bus);
+        cpu.set_flag(Flag::I, true);
+        bus.write(0xFFFA, 0x00);
+        bus.write(0xFFFB, 0xA0);
+        cpu.nmi(&mut bus);
+        assert_eq!(cpu.pc, 0xA000);
+    }
+
+    #[test]
+    fn nmi_pushes_three_bytes_to_stack() {
+        let (mut cpu, mut bus) = make();
+        bus.write(0xFFFC, 0x00);
+        bus.write(0xFFFD, 0x80);
+        cpu.reset(&mut bus);
+        let sp_before = cpu.stack.ptr;
+        cpu.nmi(&mut bus);
+        assert_eq!(cpu.stack.ptr, sp_before.wrapping_sub(3));
+    }
+
+    #[test]
+    fn nmi_takes_8_cycles() {
+        let (mut cpu, mut bus) = make();
+        cpu.nmi(&mut bus);
+        assert_eq!(cpu.cycles, 8);
+    }
+
+    // --- addressing modes ---
+
+    #[test]
+    fn imp_stores_accumulator_in_fetched() {
+        let (mut cpu, mut bus) = make();
+        cpu.a = 0x42;
+        cpu.imp(&mut bus);
+        assert_eq!(cpu.fetched, 0x42);
+    }
+
+    #[test]
+    fn imm_sets_addr_abs_to_pc_and_advances() {
+        let (mut cpu, mut bus) = setup(0x0200, &[]);
+        cpu.imm(&mut bus);
+        assert_eq!(cpu.addr_abs, 0x0200);
+        assert_eq!(cpu.pc, 0x0201);
+    }
+
+    #[test]
+    fn zp0_reads_one_byte_address() {
+        let (mut cpu, mut bus) = setup(0x0200, &[(0x0200, 0x42)]);
+        cpu.zp0(&mut bus);
+        assert_eq!(cpu.addr_abs, 0x0042);
+        assert_eq!(cpu.pc, 0x0201);
+    }
+
+    #[test]
+    fn zpx_adds_x_and_wraps_in_zero_page() {
+        let (mut cpu, mut bus) = setup(0x0200, &[(0x0200, 0xF0)]);
+        cpu.x = 0x20;
+        cpu.zpx(&mut bus);
+        assert_eq!(cpu.addr_abs, 0x0010); // 0xF0 + 0x20 = 0x110, masked to 0x0010
+    }
+
+    #[test]
+    fn zpy_adds_y_and_wraps_in_zero_page() {
+        let (mut cpu, mut bus) = setup(0x0200, &[(0x0200, 0xF0)]);
+        cpu.y = 0x10;
+        cpu.zpy(&mut bus);
+        assert_eq!(cpu.addr_abs, 0x0000); // 0xF0 + 0x10 = 0x100, masked to 0x00
+    }
+
+    #[test]
+    fn rel_positive_offset_unchanged() {
+        let (mut cpu, mut bus) = setup(0x0200, &[(0x0200, 0x10)]);
+        cpu.rel(&mut bus);
+        assert_eq!(cpu.addr_rel, 0x0010);
+    }
+
+    #[test]
+    fn rel_negative_offset_sign_extends() {
+        let (mut cpu, mut bus) = setup(0x0200, &[(0x0200, 0x80)]); // -128 as i8
+        cpu.rel(&mut bus);
+        assert_eq!(cpu.addr_rel, 0xFF80);
+    }
+
+    #[test]
+    fn abs_reads_little_endian_16bit_address() {
+        let (mut cpu, mut bus) = setup(0x0200, &[(0x0200, 0x34), (0x0201, 0x12)]);
+        cpu.abs(&mut bus);
+        assert_eq!(cpu.addr_abs, 0x1234);
+        assert_eq!(cpu.pc, 0x0202);
+    }
+
+    #[test]
+    fn abx_no_page_cross_returns_0() {
+        let (mut cpu, mut bus) = setup(0x0200, &[(0x0200, 0x00), (0x0201, 0x20)]);
+        cpu.x = 0x01;
+        let extra = cpu.abx(&mut bus);
+        assert_eq!(cpu.addr_abs, 0x2001);
+        assert_eq!(extra, 0);
+    }
+
+    #[test]
+    fn abx_page_cross_returns_1() {
+        let (mut cpu, mut bus) = setup(0x0200, &[(0x0200, 0xFF), (0x0201, 0x20)]);
+        cpu.x = 0x01;
+        let extra = cpu.abx(&mut bus);
+        assert_eq!(cpu.addr_abs, 0x2100);
+        assert_eq!(extra, 1);
+    }
+
+    #[test]
+    fn aby_no_page_cross_returns_0() {
+        let (mut cpu, mut bus) = setup(0x0200, &[(0x0200, 0x00), (0x0201, 0x20)]);
+        cpu.y = 0x10;
+        let extra = cpu.aby(&mut bus);
+        assert_eq!(cpu.addr_abs, 0x2010);
+        assert_eq!(extra, 0);
+    }
+
+    #[test]
+    fn aby_page_cross_returns_1() {
+        let (mut cpu, mut bus) = setup(0x0200, &[(0x0200, 0xFE), (0x0201, 0x20)]);
+        cpu.y = 0x02;
+        let extra = cpu.aby(&mut bus);
+        assert_eq!(cpu.addr_abs, 0x2100);
+        assert_eq!(extra, 1);
+    }
+
+    #[test]
+    fn ind_reads_address_from_pointer() {
+        let (mut cpu, mut bus) = setup(
+            0x0200,
+            &[
+                (0x0200, 0x00),
+                (0x0201, 0x30), // pointer stored at 0x3000
+                (0x3000, 0x78),
+                (0x3001, 0x56), // actual address: 0x5678
+            ],
+        );
+        cpu.ind(&mut bus);
+        assert_eq!(cpu.addr_abs, 0x5678);
+    }
+
+    #[test]
+    fn ind_page_boundary_bug_wraps_hi_byte() {
+        // pointer lo is 0xFF → hi byte wraps to start of same page, not next page
+        let (mut cpu, mut bus) = setup(
+            0x0200,
+            &[
+                (0x0200, 0xFF),
+                (0x0201, 0x30), // pointer at 0x30FF
+                (0x30FF, 0x80), // lo byte of target
+                (0x3000, 0x50), // hi byte comes from 0x3000 (bug), not 0x3100
+            ],
+        );
+        cpu.ind(&mut bus);
+        assert_eq!(cpu.addr_abs, 0x5080);
+    }
+
+    #[test]
+    fn izx_indexes_into_zero_page_by_x() {
+        let (mut cpu, mut bus) = setup(
+            0x0200,
+            &[
+                (0x0200, 0x20), // base zero-page offset
+                (0x0024, 0xCD), // lo at (0x20 + x=4) = 0x24
+                (0x0025, 0xAB), // hi at 0x25
+            ],
+        );
+        cpu.x = 0x04;
+        cpu.izx(&mut bus);
+        assert_eq!(cpu.addr_abs, 0xABCD);
+    }
+
+    #[test]
+    fn izy_no_page_cross_returns_0() {
+        let (mut cpu, mut bus) = setup(
+            0x0200,
+            &[
+                (0x0200, 0x40), // zero-page pointer address
+                (0x0040, 0x00), // lo byte → base = 0x3000
+                (0x0041, 0x30),
+            ],
+        );
+        cpu.y = 0x10;
+        let extra = cpu.izy(&mut bus);
+        assert_eq!(cpu.addr_abs, 0x3010);
+        assert_eq!(extra, 0);
+    }
+
+    #[test]
+    fn izy_page_cross_returns_1() {
+        let (mut cpu, mut bus) = setup(
+            0x0200,
+            &[
+                (0x0200, 0x40),
+                (0x0040, 0xFF), // lo byte → base = 0x30FF
+                (0x0041, 0x30),
+            ],
+        );
+        cpu.y = 0x01;
+        let extra = cpu.izy(&mut bus);
+        assert_eq!(cpu.addr_abs, 0x3100);
+        assert_eq!(extra, 1);
+    }
+
+    // --- zp0 edge cases ---
+
+    #[test]
+    fn zp0_max_address_stays_in_zero_page() {
+        let (mut cpu, mut bus) = setup(0x0200, &[(0x0200, 0xFF)]);
+        cpu.zp0(&mut bus);
+        assert_eq!(cpu.addr_abs, 0x00FF);
+    }
+
+    // --- zpx edge cases ---
+
+    #[test]
+    fn zpx_result_at_top_of_zero_page_no_wrap() {
+        // 0xFE + 0x01 = 0xFF — max zero-page address, no wrap
+        let (mut cpu, mut bus) = setup(0x0200, &[(0x0200, 0xFE)]);
+        cpu.x = 0x01;
+        cpu.zpx(&mut bus);
+        assert_eq!(cpu.addr_abs, 0x00FF);
+    }
+
+    #[test]
+    fn zpx_wraps_from_ff_to_zero() {
+        // 0xFF + 0x01 = 0x100, masked to 0x00
+        let (mut cpu, mut bus) = setup(0x0200, &[(0x0200, 0xFF)]);
+        cpu.x = 0x01;
+        cpu.zpx(&mut bus);
+        assert_eq!(cpu.addr_abs, 0x0000);
+    }
+
+    // --- zpy edge cases ---
+
+    #[test]
+    fn zpy_wraps_from_ff_to_zero() {
+        // 0xFF + 0x01 = 0x100, masked to 0x00
+        let (mut cpu, mut bus) = setup(0x0200, &[(0x0200, 0xFF)]);
+        cpu.y = 0x01;
+        cpu.zpy(&mut bus);
+        assert_eq!(cpu.addr_abs, 0x0000);
+    }
+
+    // --- rel edge cases ---
+
+    #[test]
+    fn rel_max_positive_offset() {
+        // 0x7F = +127, maximum positive branch range
+        let (mut cpu, mut bus) = setup(0x0200, &[(0x0200, 0x7F)]);
+        cpu.rel(&mut bus);
+        assert_eq!(cpu.addr_rel, 0x007F);
+    }
+
+    #[test]
+    fn rel_minus_one() {
+        // 0xFF = -1 as i8, sign-extends to 0xFFFF
+        let (mut cpu, mut bus) = setup(0x0200, &[(0x0200, 0xFF)]);
+        cpu.rel(&mut bus);
+        assert_eq!(cpu.addr_rel, 0xFFFF);
+    }
+
+    // --- abs edge cases ---
+
+    #[test]
+    fn abs_top_of_address_space() {
+        let (mut cpu, mut bus) = setup(0x0200, &[(0x0200, 0xFF), (0x0201, 0xFF)]);
+        cpu.abs(&mut bus);
+        assert_eq!(cpu.addr_abs, 0xFFFF);
+    }
+
+    // --- abx edge cases ---
+
+    #[test]
+    fn abx_last_byte_of_page_no_cross() {
+        // 0x20FE + 1 = 0x20FF — still on same page, no extra cycle
+        let (mut cpu, mut bus) = setup(0x0200, &[(0x0200, 0xFE), (0x0201, 0x20)]);
+        cpu.x = 0x01;
+        let extra = cpu.abx(&mut bus);
+        assert_eq!(cpu.addr_abs, 0x20FF);
+        assert_eq!(extra, 0);
+    }
+
+    // --- aby edge cases ---
+
+    #[test]
+    fn aby_last_byte_of_page_no_cross() {
+        // 0x20FE + 1 = 0x20FF — still on same page, no extra cycle
+        let (mut cpu, mut bus) = setup(0x0200, &[(0x0200, 0xFE), (0x0201, 0x20)]);
+        cpu.y = 0x01;
+        let extra = cpu.aby(&mut bus);
+        assert_eq!(cpu.addr_abs, 0x20FF);
+        assert_eq!(extra, 0);
+    }
+
+    // --- ind edge cases ---
+
+    #[test]
+    fn ind_page_boundary_bug_in_page_zero() {
+        // pointer at 0x00FF: hi byte wraps to 0x0000, not 0x0100
+        let (mut cpu, mut bus) = setup(
+            0x0200,
+            &[
+                (0x0200, 0xFF),
+                (0x0201, 0x00), // pointer = 0x00FF
+                (0x00FF, 0x34), // lo byte of target
+                (0x0000, 0x12), // hi byte (bug: 0x0000, not 0x0100)
+            ],
+        );
+        cpu.ind(&mut bus);
+        assert_eq!(cpu.addr_abs, 0x1234);
+    }
+
+    // --- izx edge cases ---
+
+    #[test]
+    fn izx_pointer_wraps_at_ff() {
+        // base = (0xFB + x=4) & 0xFF = 0xFF; hi must come from 0x0000, not 0x0100
+        let (mut cpu, mut bus) = setup(
+            0x0200,
+            &[
+                (0x0200, 0xFB),
+                (0x00FF, 0xCD), // lo byte at 0xFF
+                (0x0000, 0xAB), // hi byte wraps to 0x0000
+            ],
+        );
+        cpu.x = 0x04;
+        cpu.izx(&mut bus);
+        assert_eq!(cpu.addr_abs, 0xABCD);
+    }
+
+    // --- izy edge cases ---
+
+    #[test]
+    fn izy_pointer_address_at_ff() {
+        // pointer lives at 0xFF; hi byte must come from 0x0000, not 0x0100
+        let (mut cpu, mut bus) = setup(
+            0x0200,
+            &[
+                (0x0200, 0xFF), // zero-page pointer address
+                (0x00FF, 0x00), // lo byte of base → base = 0x3000
+                (0x0000, 0x30), // hi byte wraps to 0x0000
+            ],
+        );
+        cpu.y = 0x05;
+        let extra = cpu.izy(&mut bus);
+        assert_eq!(cpu.addr_abs, 0x3005);
+        assert_eq!(extra, 0);
+    }
+
+    // --- clock ---
+
+    #[test]
+    fn clock_advances_pc_past_opcode() {
+        // NOP = 0xEA, IMP addressing, 2 cycles
+        let (mut cpu, mut bus) = setup(0x0200, &[(0x0200, 0xEA)]);
+        cpu.clock(&mut bus);
+        assert_eq!(cpu.pc, 0x0201);
+    }
+
+    #[test]
+    fn clock_counts_down_cycles_for_nop() {
+        let (mut cpu, mut bus) = setup(0x0200, &[(0x0200, 0xEA)]);
+        cpu.clock(&mut bus); // execute: cycles set to 2, then decremented → 1
+        assert_eq!(cpu.cycles, 1);
+        cpu.clock(&mut bus); // just ticks: cycles → 0
+        assert_eq!(cpu.cycles, 0);
+    }
+
+    #[test]
+    fn clock_does_not_execute_until_cycles_zero() {
+        // Two NOPs back to back
+        let (mut cpu, mut bus) = setup(0x0200, &[(0x0200, 0xEA), (0x0201, 0xEA)]);
+        cpu.clock(&mut bus); // executes first NOP, cycles = 1
+        cpu.clock(&mut bus); // ticks down, cycles = 0, PC still at 0x0201
+        assert_eq!(cpu.pc, 0x0201);
+        cpu.clock(&mut bus); // executes second NOP
+        assert_eq!(cpu.pc, 0x0202);
+    }
+}
+
+fn build_lookup() -> [Instruction; 256] {
+    macro_rules! i {
+        ($name:literal, $op:ident, $am:ident, $c:literal) => {
+            Instruction {
+                name: $name,
+                operate: Cpu::$op,
+                addr_mode: Cpu::$am,
+                cycles: $c,
+            }
+        };
+    }
+
+    [
+        //         0                              1                              2                              3                              4                              5                              6                              7                              8                              9                              A                              B                              C                              D                              E                              F
+        /* 0 */
+        i!("BRK", brk, imm, 7),
+        i!("ORA", ora, izx, 6),
+        i!("???", xxx, imp, 2),
+        i!("???", xxx, imp, 8),
+        i!("???", nop, imp, 3),
+        i!("ORA", ora, zp0, 3),
+        i!("ASL", asl, zp0, 5),
+        i!("???", xxx, imp, 5),
+        i!("PHP", php, imp, 3),
+        i!("ORA", ora, imm, 2),
+        i!("ASL", asl, imp, 2),
+        i!("???", xxx, imp, 2),
+        i!("???", nop, imp, 4),
+        i!("ORA", ora, abs, 4),
+        i!("ASL", asl, abs, 6),
+        i!("???", xxx, imp, 6),
+        /* 1 */ i!("BPL", bpl, rel, 2),
+        i!("ORA", ora, izy, 5),
+        i!("???", xxx, imp, 2),
+        i!("???", xxx, imp, 8),
+        i!("???", nop, imp, 4),
+        i!("ORA", ora, zpx, 4),
+        i!("ASL", asl, zpx, 6),
+        i!("???", xxx, imp, 6),
+        i!("CLC", clc, imp, 2),
+        i!("ORA", ora, aby, 4),
+        i!("???", nop, imp, 2),
+        i!("???", xxx, imp, 7),
+        i!("???", nop, imp, 4),
+        i!("ORA", ora, abx, 4),
+        i!("ASL", asl, abx, 7),
+        i!("???", xxx, imp, 7),
+        /* 2 */ i!("JSR", jsr, abs, 6),
+        i!("AND", and, izx, 6),
+        i!("???", xxx, imp, 2),
+        i!("???", xxx, imp, 8),
+        i!("BIT", bit, zp0, 3),
+        i!("AND", and, zp0, 3),
+        i!("ROL", rol, zp0, 5),
+        i!("???", xxx, imp, 5),
+        i!("PLP", plp, imp, 4),
+        i!("AND", and, imm, 2),
+        i!("ROL", rol, imp, 2),
+        i!("???", xxx, imp, 2),
+        i!("BIT", bit, abs, 4),
+        i!("AND", and, abs, 4),
+        i!("ROL", rol, abs, 6),
+        i!("???", xxx, imp, 6),
+        /* 3 */ i!("BMI", bmi, rel, 2),
+        i!("AND", and, izy, 5),
+        i!("???", xxx, imp, 2),
+        i!("???", xxx, imp, 8),
+        i!("???", nop, imp, 4),
+        i!("AND", and, zpx, 4),
+        i!("ROL", rol, zpx, 6),
+        i!("???", xxx, imp, 6),
+        i!("SEC", sec, imp, 2),
+        i!("AND", and, aby, 4),
+        i!("???", nop, imp, 2),
+        i!("???", xxx, imp, 7),
+        i!("???", nop, imp, 4),
+        i!("AND", and, abx, 4),
+        i!("ROL", rol, abx, 7),
+        i!("???", xxx, imp, 7),
+        /* 4 */ i!("RTI", rti, imp, 6),
+        i!("EOR", eor, izx, 6),
+        i!("???", xxx, imp, 2),
+        i!("???", xxx, imp, 8),
+        i!("???", nop, imp, 3),
+        i!("EOR", eor, zp0, 3),
+        i!("LSR", lsr, zp0, 5),
+        i!("???", xxx, imp, 5),
+        i!("PHA", pha, imp, 3),
+        i!("EOR", eor, imm, 2),
+        i!("LSR", lsr, imp, 2),
+        i!("???", xxx, imp, 2),
+        i!("JMP", jmp, abs, 3),
+        i!("EOR", eor, abs, 4),
+        i!("LSR", lsr, abs, 6),
+        i!("???", xxx, imp, 6),
+        /* 5 */ i!("BVC", bvc, rel, 2),
+        i!("EOR", eor, izy, 5),
+        i!("???", xxx, imp, 2),
+        i!("???", xxx, imp, 8),
+        i!("???", nop, imp, 4),
+        i!("EOR", eor, zpx, 4),
+        i!("LSR", lsr, zpx, 6),
+        i!("???", xxx, imp, 6),
+        i!("CLI", cli, imp, 2),
+        i!("EOR", eor, aby, 4),
+        i!("???", nop, imp, 2),
+        i!("???", xxx, imp, 7),
+        i!("???", nop, imp, 4),
+        i!("EOR", eor, abx, 4),
+        i!("LSR", lsr, abx, 7),
+        i!("???", xxx, imp, 7),
+        /* 6 */ i!("RTS", rts, imp, 6),
+        i!("ADC", adc, izx, 6),
+        i!("???", xxx, imp, 2),
+        i!("???", xxx, imp, 8),
+        i!("???", nop, imp, 3),
+        i!("ADC", adc, zp0, 3),
+        i!("ROR", ror, zp0, 5),
+        i!("???", xxx, imp, 5),
+        i!("PLA", pla, imp, 4),
+        i!("ADC", adc, imm, 2),
+        i!("ROR", ror, imp, 2),
+        i!("???", xxx, imp, 2),
+        i!("JMP", jmp, ind, 5),
+        i!("ADC", adc, abs, 4),
+        i!("ROR", ror, abs, 6),
+        i!("???", xxx, imp, 6),
+        /* 7 */ i!("BVS", bvs, rel, 2),
+        i!("ADC", adc, izy, 5),
+        i!("???", xxx, imp, 2),
+        i!("???", xxx, imp, 8),
+        i!("???", nop, imp, 4),
+        i!("ADC", adc, zpx, 4),
+        i!("ROR", ror, zpx, 6),
+        i!("???", xxx, imp, 6),
+        i!("SEI", sei, imp, 2),
+        i!("ADC", adc, aby, 4),
+        i!("???", nop, imp, 2),
+        i!("???", xxx, imp, 7),
+        i!("???", nop, imp, 4),
+        i!("ADC", adc, abx, 4),
+        i!("ROR", ror, abx, 7),
+        i!("???", xxx, imp, 7),
+        /* 8 */ i!("???", nop, imp, 2),
+        i!("STA", sta, izx, 6),
+        i!("???", nop, imp, 2),
+        i!("???", xxx, imp, 6),
+        i!("STY", sty, zp0, 3),
+        i!("STA", sta, zp0, 3),
+        i!("STX", stx, zp0, 3),
+        i!("???", xxx, imp, 3),
+        i!("DEY", dey, imp, 2),
+        i!("???", nop, imp, 2),
+        i!("TXA", txa, imp, 2),
+        i!("???", xxx, imp, 2),
+        i!("STY", sty, abs, 4),
+        i!("STA", sta, abs, 4),
+        i!("STX", stx, abs, 4),
+        i!("???", xxx, imp, 4),
+        /* 9 */ i!("BCC", bcc, rel, 2),
+        i!("STA", sta, izy, 6),
+        i!("???", xxx, imp, 2),
+        i!("???", xxx, imp, 6),
+        i!("STY", sty, zpx, 4),
+        i!("STA", sta, zpx, 4),
+        i!("STX", stx, zpy, 4),
+        i!("???", xxx, imp, 4),
+        i!("TYA", tya, imp, 2),
+        i!("STA", sta, aby, 5),
+        i!("TXS", txs, imp, 2),
+        i!("???", xxx, imp, 5),
+        i!("???", nop, imp, 5),
+        i!("STA", sta, abx, 5),
+        i!("???", xxx, imp, 5),
+        i!("???", xxx, imp, 5),
+        /* A */ i!("LDY", ldy, imm, 2),
+        i!("LDA", lda, izx, 6),
+        i!("LDX", ldx, imm, 2),
+        i!("???", xxx, imp, 6),
+        i!("LDY", ldy, zp0, 3),
+        i!("LDA", lda, zp0, 3),
+        i!("LDX", ldx, zp0, 3),
+        i!("???", xxx, imp, 3),
+        i!("TAY", tay, imp, 2),
+        i!("LDA", lda, imm, 2),
+        i!("TAX", tax, imp, 2),
+        i!("???", xxx, imp, 2),
+        i!("LDY", ldy, abs, 4),
+        i!("LDA", lda, abs, 4),
+        i!("LDX", ldx, abs, 4),
+        i!("???", xxx, imp, 4),
+        /* B */ i!("BCS", bcs, rel, 2),
+        i!("LDA", lda, izy, 5),
+        i!("???", xxx, imp, 2),
+        i!("???", xxx, imp, 5),
+        i!("LDY", ldy, zpx, 4),
+        i!("LDA", lda, zpx, 4),
+        i!("LDX", ldx, zpy, 4),
+        i!("???", xxx, imp, 4),
+        i!("CLV", clv, imp, 2),
+        i!("LDA", lda, aby, 4),
+        i!("TSX", tsx, imp, 2),
+        i!("???", xxx, imp, 4),
+        i!("LDY", ldy, abx, 4),
+        i!("LDA", lda, abx, 4),
+        i!("LDX", ldx, aby, 4),
+        i!("???", xxx, imp, 4),
+        /* C */ i!("CPY", cpy, imm, 2),
+        i!("CMP", cmp, izx, 6),
+        i!("???", nop, imp, 2),
+        i!("???", xxx, imp, 8),
+        i!("CPY", cpy, zp0, 3),
+        i!("CMP", cmp, zp0, 3),
+        i!("DEC", dec, zp0, 5),
+        i!("???", xxx, imp, 5),
+        i!("INY", iny, imp, 2),
+        i!("CMP", cmp, imm, 2),
+        i!("DEX", dex, imp, 2),
+        i!("???", xxx, imp, 2),
+        i!("CPY", cpy, abs, 4),
+        i!("CMP", cmp, abs, 4),
+        i!("DEC", dec, abs, 6),
+        i!("???", xxx, imp, 6),
+        /* D */ i!("BNE", bne, rel, 2),
+        i!("CMP", cmp, izy, 5),
+        i!("???", xxx, imp, 2),
+        i!("???", xxx, imp, 8),
+        i!("???", nop, imp, 4),
+        i!("CMP", cmp, zpx, 4),
+        i!("DEC", dec, zpx, 6),
+        i!("???", xxx, imp, 6),
+        i!("CLD", cld, imp, 2),
+        i!("CMP", cmp, aby, 4),
+        i!("NOP", nop, imp, 2),
+        i!("???", xxx, imp, 7),
+        i!("???", nop, imp, 4),
+        i!("CMP", cmp, abx, 4),
+        i!("DEC", dec, abx, 7),
+        i!("???", xxx, imp, 7),
+        /* E */ i!("CPX", cpx, imm, 2),
+        i!("SBC", sbc, izx, 6),
+        i!("???", nop, imp, 2),
+        i!("???", xxx, imp, 8),
+        i!("CPX", cpx, zp0, 3),
+        i!("SBC", sbc, zp0, 3),
+        i!("INC", inc, zp0, 5),
+        i!("???", xxx, imp, 5),
+        i!("INX", inx, imp, 2),
+        i!("SBC", sbc, imm, 2),
+        i!("NOP", nop, imp, 2),
+        i!("???", sbc, imp, 2),
+        i!("CPX", cpx, abs, 4),
+        i!("SBC", sbc, abs, 4),
+        i!("INC", inc, abs, 6),
+        i!("???", xxx, imp, 6),
+        /* F */ i!("BEQ", beq, rel, 2),
+        i!("SBC", sbc, izy, 5),
+        i!("???", xxx, imp, 2),
+        i!("???", xxx, imp, 8),
+        i!("???", nop, imp, 4),
+        i!("SBC", sbc, zpx, 4),
+        i!("INC", inc, zpx, 6),
+        i!("???", xxx, imp, 6),
+        i!("SED", sed, imp, 2),
+        i!("SBC", sbc, aby, 4),
+        i!("NOP", nop, imp, 2),
+        i!("???", xxx, imp, 7),
+        i!("???", nop, imp, 4),
+        i!("SBC", sbc, abx, 4),
+        i!("INC", inc, abx, 7),
+        i!("???", xxx, imp, 7),
+    ]
 }

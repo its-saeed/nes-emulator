@@ -13,6 +13,10 @@ impl Bus {
         self.ram[addr as usize]
     }
 
+    pub fn read_u16(&self, addr: u16) -> u16 {
+        self.read(addr) as u16 | (self.read(addr.wrapping_add(1)) as u16) << 8
+    }
+
     pub fn write(&mut self, addr: u16, data: u8) {
         self.ram[addr as usize] = data;
     }
