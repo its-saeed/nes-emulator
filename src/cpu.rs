@@ -1,3 +1,5 @@
+use std::sync::atomic::fence;
+
 use crate::bus::Bus;
 
 const NMI_VECTOR: u16 = 0xFFFA;
@@ -250,6 +252,11 @@ impl Cpu {
         };
         self.fetched
     }
+
+    fn set_n_z_flags(&mut self, last_result: u8) {
+        self.set_flag(Flag::Z, if last_result == 0 { true } else { false });
+        self.set_flag(Flag::N, if (last_result as i8) < 0 { true } else { false });
+    }
 }
 
 impl Cpu {
@@ -451,13 +458,40 @@ impl Cpu {
     fn nop(&mut self, _bus: &mut Bus) -> u8 {
         0
     }
-    fn adc(&mut self, _bus: &mut Bus) -> u8 {
-        0
+    fn adc(&mut self, bus: &mut Bus) -> u8 {
+        // tmp = (A as u16) + (fetch() as u16) + (C as u16)
+        // C = tmp > 0xFF
+        // Z = (tmp & 0xFF) == 0
+        // N = tmp & 0x80
+        // V = (~(A ^ fetch()) & (A ^ tmp)) & 0x80  — set when both inputs have same sign but result has different sign
+        // A = tmp & 0xFF
+        // return 1
+        todo!()
     }
-    fn and(&mut self, _bus: &mut Bus) -> u8 {
-        0
+    fn and(&mut self, bus: &mut Bus) -> u8 {
+        // A = A & fetch(); set N, Z; return 1
+        self.a = self.a & self.fetch(bus);
+        self.set_n_z_flags(self.a);
+        1
     }
-    fn asl(&mut self, _bus: &mut Bus) -> u8 {
+    fn asl(&mut self, bus: &mut Bus) -> u8 {
+        // val = fetch()
+        // C = val & 0x80  (old bit 7 shifts into carry)
+        // val = val << 1
+        // if imp mode: A = val; else write(addr_abs, val)
+        // set N, Z; return 0
+        let value = self.fetch(bus);
+        let new_value = value << 1;
+        self.set_flag(Flag::C, value & 0x80 > 0);
+        if std::ptr::fn_addr_eq(
+            self.lookup[self.opcode as usize].addr_mode,
+            Cpu::imp as fn(&mut Cpu, &mut Bus) -> u8,
+        ) {
+            self.a = new_value;
+        } else {
+            bus.write(self.addr_abs, new_value);
+        }
+        self.set_n_z_flags(new_value);
         0
     }
     fn bcc(&mut self, _bus: &mut Bus) -> u8 {
@@ -469,7 +503,16 @@ impl Cpu {
     fn beq(&mut self, _bus: &mut Bus) -> u8 {
         0
     }
-    fn bit(&mut self, _bus: &mut Bus) -> u8 {
+    fn bit(&mut self, bus: &mut Bus) -> u8 {
+        // val = fetch()
+        // Z = (A & val) == 0
+        // N = val & 0x80   (bit 7 of memory value, NOT of A & val)
+        // V = val & 0x40   (bit 6 of memory value)
+        // return 0
+        let value = self.fetch(bus);
+        self.set_flag(Flag::Z, self.a & value == 0);
+        self.set_flag(Flag::N, value & 0x80 > 0);
+        self.set_flag(Flag::V, value & 0x40 > 0);
         0
     }
     fn bmi(&mut self, _bus: &mut Bus) -> u8 {
@@ -491,45 +534,91 @@ impl Cpu {
         0
     }
     fn clc(&mut self, _bus: &mut Bus) -> u8 {
+        self.set_flag(Flag::C, false);
         0
     }
     fn cld(&mut self, _bus: &mut Bus) -> u8 {
+        self.set_flag(Flag::D, false);
         0
     }
     fn cli(&mut self, _bus: &mut Bus) -> u8 {
+        self.set_flag(Flag::I, false);
         0
     }
     fn clv(&mut self, _bus: &mut Bus) -> u8 {
+        self.set_flag(Flag::V, false);
         0
     }
-    fn cmp(&mut self, _bus: &mut Bus) -> u8 {
+    fn cmp(&mut self, bus: &mut Bus) -> u8 {
+        // tmp = (A as u16).wrapping_sub(fetch() as u16)
+        // C = A >= fetched  (no borrow means carry set)
+        // Z = (tmp & 0x00FF) == 0
+        // N = tmp & 0x0080
+        // return 1
+        let tmp = (self.a as u16).wrapping_sub(self.fetch(bus) as u16);
+        self.set_flag(Flag::C, self.a >= self.fetched)
+            .set_flag(Flag::Z, tmp & 0x00ff == 0)
+            .set_flag(Flag::N, tmp & 0x0080 != 0);
+        1
+    }
+    fn cpx(&mut self, bus: &mut Bus) -> u8 {
+        // same as cmp but compare X instead of A; return 0
+        let tmp = (self.x as u16).wrapping_sub(self.fetch(bus) as u16);
+        self.set_flag(Flag::C, self.x >= self.fetched)
+            .set_flag(Flag::Z, tmp & 0x00ff == 0)
+            .set_flag(Flag::N, tmp & 0x0080 != 0);
         0
     }
-    fn cpx(&mut self, _bus: &mut Bus) -> u8 {
+    fn cpy(&mut self, bus: &mut Bus) -> u8 {
+        // same as cmp but compare Y instead of A; return 0
+        let tmp = (self.y as u16).wrapping_sub(self.fetch(bus) as u16);
+        self.set_flag(Flag::C, self.y >= self.fetched)
+            .set_flag(Flag::Z, tmp & 0x00ff == 0)
+            .set_flag(Flag::N, tmp & 0x0080 != 0);
         0
     }
-    fn cpy(&mut self, _bus: &mut Bus) -> u8 {
-        0
-    }
-    fn dec(&mut self, _bus: &mut Bus) -> u8 {
+    fn dec(&mut self, bus: &mut Bus) -> u8 {
+        // val = read(addr_abs).wrapping_sub(1); write(addr_abs, val); set N, Z; return 0
+        let value = bus.read(self.addr_abs).wrapping_sub(1);
+        bus.write(self.addr_abs, value);
+        self.set_n_z_flags(value);
         0
     }
     fn dex(&mut self, _bus: &mut Bus) -> u8 {
+        // X = X.wrapping_sub(1); set N, Z; return 0
+        self.x = self.x.wrapping_sub(1);
+        self.set_n_z_flags(self.x);
         0
     }
     fn dey(&mut self, _bus: &mut Bus) -> u8 {
+        // Y = Y.wrapping_sub(1); set N, Z; return 0
+        self.y = self.y.wrapping_sub(1);
+        self.set_n_z_flags(self.y);
         0
     }
-    fn eor(&mut self, _bus: &mut Bus) -> u8 {
-        0
+    fn eor(&mut self, bus: &mut Bus) -> u8 {
+        // A = A ^ fetch(); set N, Z; return 1
+        self.a = self.a ^ self.fetch(bus);
+        self.set_n_z_flags(self.a);
+        1
     }
-    fn inc(&mut self, _bus: &mut Bus) -> u8 {
+    fn inc(&mut self, bus: &mut Bus) -> u8 {
+        // val = read(addr_abs).wrapping_add(1); write(addr_abs, val); set N, Z; return 0
+        let value = bus.read(self.addr_abs).wrapping_add(1);
+        bus.write(self.addr_abs, value);
+        self.set_n_z_flags(value);
         0
     }
     fn inx(&mut self, _bus: &mut Bus) -> u8 {
+        // X = X.wrapping_add(1); set N, Z; return 0
+        self.x = self.x.wrapping_add(1);
+        self.set_n_z_flags(self.x);
         0
     }
     fn iny(&mut self, _bus: &mut Bus) -> u8 {
+        // Y = Y.wrapping_add(1); set N, Z; return 0
+        self.y = self.y.wrapping_add(1);
+        self.set_n_z_flags(self.y);
         0
     }
     fn jmp(&mut self, _bus: &mut Bus) -> u8 {
@@ -538,37 +627,116 @@ impl Cpu {
     fn jsr(&mut self, _bus: &mut Bus) -> u8 {
         0
     }
-    fn lda(&mut self, _bus: &mut Bus) -> u8 {
+    fn lda(&mut self, bus: &mut Bus) -> u8 {
+        // A = fetch(); set N, Z; return 1
+        self.a = self.fetch(bus);
+        self.set_flag(Flag::Z, if self.a == 0 { true } else { false });
+        self.set_flag(Flag::N, if (self.a as i8) < 0 { true } else { false });
+        1
+    }
+    fn ldx(&mut self, bus: &mut Bus) -> u8 {
+        // X = fetch(); set N, Z; return 1
+        self.x = self.fetch(bus);
+        self.set_flag(Flag::Z, if self.x == 0 { true } else { false });
+        self.set_flag(Flag::N, if (self.x as i8) < 0 { true } else { false });
+        1
+    }
+    fn ldy(&mut self, bus: &mut Bus) -> u8 {
+        // Y = fetch(); set N, Z; return 1
+        self.y = self.fetch(bus);
+        self.set_flag(Flag::Z, if self.y == 0 { true } else { false });
+        self.set_flag(Flag::N, if (self.y as i8) < 0 { true } else { false });
+        1
+    }
+    fn lsr(&mut self, bus: &mut Bus) -> u8 {
+        // val = fetch()
+        // C = val & 0x01  (old bit 0 shifts into carry)
+        // val = val >> 1   (N is always 0 after LSR — bit 7 becomes 0)
+        // if imp mode: A = val; else write(addr_abs, val)
+        // set N (always 0), Z; return 0
+        let value = self.fetch(bus);
+        let new_value = value >> 1;
+        self.set_flag(Flag::C, value & 0x01 > 0);
+        if std::ptr::fn_addr_eq(
+            self.lookup[self.opcode as usize].addr_mode,
+            Cpu::imp as fn(&mut Cpu, &mut Bus) -> u8,
+        ) {
+            self.a = new_value;
+        } else {
+            bus.write(self.addr_abs, new_value);
+        }
+        self.set_n_z_flags(new_value);
         0
     }
-    fn ldx(&mut self, _bus: &mut Bus) -> u8 {
+    fn ora(&mut self, bus: &mut Bus) -> u8 {
+        // A = A | fetch(); set N, Z; return 1
+        self.a = self.a | self.fetch(bus);
+        self.set_n_z_flags(self.a);
+        1
+    }
+    fn pha(&mut self, bus: &mut Bus) -> u8 {
+        // stack.push(A); no flags; return 0
+        self.stack.push(self.a, bus);
         0
     }
-    fn ldy(&mut self, _bus: &mut Bus) -> u8 {
+    fn php(&mut self, bus: &mut Bus) -> u8 {
+        // stack.push(status | B | U); no flags changed on cpu.status; return 0
+        self.stack
+            .push(self.status | Flag::B as u8 | Flag::U as u8, bus);
         0
     }
-    fn lsr(&mut self, _bus: &mut Bus) -> u8 {
+    fn pla(&mut self, bus: &mut Bus) -> u8 {
+        // A = stack.pop(); set N, Z; return 0
+        self.a = self.stack.pop(bus);
+        self.set_flag(Flag::Z, if self.a == 0 { true } else { false });
+        self.set_flag(Flag::N, if (self.a as i8) < 0 { true } else { false });
         0
     }
-    fn ora(&mut self, _bus: &mut Bus) -> u8 {
+    fn plp(&mut self, bus: &mut Bus) -> u8 {
+        // status = stack.pop(); then clear B, set U; return 0
+        self.status = self.stack.pop(bus);
+        self.set_flag(Flag::U, true);
+        self.set_flag(Flag::B, false);
         0
     }
-    fn pha(&mut self, _bus: &mut Bus) -> u8 {
+    fn rol(&mut self, bus: &mut Bus) -> u8 {
+        // val = fetch()
+        // new_val = (val << 1) | C   (old carry rotates into bit 0)
+        // C = val & 0x80              (old bit 7 rotates into carry)
+        // if imp mode: A = new_val; else write(addr_abs, new_val)
+        // set N, Z; return 0
+        let value = self.fetch(bus);
+        let new_value = (value << 1) | self.get_flag(Flag::C) as u8;
+        self.set_flag(Flag::C, value & 0x80 > 0);
+        if std::ptr::fn_addr_eq(
+            self.lookup[self.opcode as usize].addr_mode,
+            Cpu::imp as fn(&mut Cpu, &mut Bus) -> u8,
+        ) {
+            self.a = new_value;
+        } else {
+            bus.write(self.addr_abs, new_value);
+        }
+        self.set_n_z_flags(new_value);
         0
     }
-    fn php(&mut self, _bus: &mut Bus) -> u8 {
-        0
-    }
-    fn pla(&mut self, _bus: &mut Bus) -> u8 {
-        0
-    }
-    fn plp(&mut self, _bus: &mut Bus) -> u8 {
-        0
-    }
-    fn rol(&mut self, _bus: &mut Bus) -> u8 {
-        0
-    }
-    fn ror(&mut self, _bus: &mut Bus) -> u8 {
+    fn ror(&mut self, bus: &mut Bus) -> u8 {
+        // val = fetch()
+        // new_val = (val >> 1) | (C << 7)  (old carry rotates into bit 7)
+        // C = val & 0x01                    (old bit 0 rotates into carry)
+        // if imp mode: A = new_val; else write(addr_abs, new_val)
+        // set N, Z; return 0
+        let value = self.fetch(bus);
+        let new_value = (value >> 1) | ((self.get_flag(Flag::C) as u8) << 7);
+        self.set_flag(Flag::C, value & 0x01 > 0);
+        if std::ptr::fn_addr_eq(
+            self.lookup[self.opcode as usize].addr_mode,
+            Cpu::imp as fn(&mut Cpu, &mut Bus) -> u8,
+        ) {
+            self.a = new_value;
+        } else {
+            bus.write(self.addr_abs, new_value);
+        }
+        self.set_n_z_flags(new_value);
         0
     }
     fn rti(&mut self, _bus: &mut Bus) -> u8 {
@@ -577,43 +745,80 @@ impl Cpu {
     fn rts(&mut self, _bus: &mut Bus) -> u8 {
         0
     }
-    fn sbc(&mut self, _bus: &mut Bus) -> u8 {
-        0
+    fn sbc(&mut self, bus: &mut Bus) -> u8 {
+        // SBC is ADC with the operand bit-flipped:
+        // tmp = (A as u16) + (fetch() ^ 0xFF) as u16 + (C as u16)
+        // same flag logic as ADC (C, Z, N, V), same V formula
+        // A = tmp & 0xFF
+        // return 1
+        todo!()
     }
     fn sec(&mut self, _bus: &mut Bus) -> u8 {
+        self.set_flag(Flag::C, true);
         0
     }
     fn sed(&mut self, _bus: &mut Bus) -> u8 {
+        self.set_flag(Flag::D, true);
         0
     }
     fn sei(&mut self, _bus: &mut Bus) -> u8 {
+        // I = 1
+        self.set_flag(Flag::I, true);
         0
     }
-    fn sta(&mut self, _bus: &mut Bus) -> u8 {
+    fn sta(&mut self, bus: &mut Bus) -> u8 {
+        // write(addr_abs, A); no flags; return 0
+        bus.write(self.addr_abs, self.a);
         0
     }
-    fn stx(&mut self, _bus: &mut Bus) -> u8 {
+    fn stx(&mut self, bus: &mut Bus) -> u8 {
+        // write(addr_abs, X); no flags; return 0
+        bus.write(self.addr_abs, self.x);
         0
     }
-    fn sty(&mut self, _bus: &mut Bus) -> u8 {
+    fn sty(&mut self, bus: &mut Bus) -> u8 {
+        // write(addr_abs, Y); no flags; return 0
+        bus.write(self.addr_abs, self.y);
         0
     }
     fn tax(&mut self, _bus: &mut Bus) -> u8 {
+        // X = A; set N, Z; return 0
+        self.x = self.a;
+        self.set_flag(Flag::Z, if self.x == 0 { true } else { false });
+        self.set_flag(Flag::N, if (self.x as i8) < 0 { true } else { false });
         0
     }
     fn tay(&mut self, _bus: &mut Bus) -> u8 {
+        // Y = A; set N, Z; return 0
+        self.y = self.a;
+        self.set_flag(Flag::Z, if self.y == 0 { true } else { false });
+        self.set_flag(Flag::N, if (self.y as i8) < 0 { true } else { false });
         0
     }
     fn tsx(&mut self, _bus: &mut Bus) -> u8 {
+        // X = stack.ptr; set N, Z; return 0
+        self.x = self.stack.ptr;
+        self.set_flag(Flag::Z, if self.x == 0 { true } else { false });
+        self.set_flag(Flag::N, if (self.x as i8) < 0 { true } else { false });
         0
     }
     fn txa(&mut self, _bus: &mut Bus) -> u8 {
+        // A = X; set N, Z; return 0
+        self.a = self.x;
+        self.set_flag(Flag::Z, if self.a == 0 { true } else { false });
+        self.set_flag(Flag::N, if (self.a as i8) < 0 { true } else { false });
         0
     }
     fn txs(&mut self, _bus: &mut Bus) -> u8 {
+        // stack.ptr = X; no flags; return 0
+        self.stack.ptr = self.x;
         0
     }
     fn tya(&mut self, _bus: &mut Bus) -> u8 {
+        // A = Y; set N, Z; return 0
+        self.a = self.y;
+        self.set_flag(Flag::Z, if self.a == 0 { true } else { false });
+        self.set_flag(Flag::N, if (self.a as i8) < 0 { true } else { false });
         0
     }
 }
@@ -1093,6 +1298,990 @@ mod tests {
         let extra = cpu.izy(&mut bus);
         assert_eq!(cpu.addr_abs, 0x3005);
         assert_eq!(extra, 0);
+    }
+
+    // --- flag ops ---
+
+    #[test]
+    fn clc_clears_carry() {
+        let (mut cpu, mut bus) = make();
+        cpu.set_flag(Flag::C, true);
+        cpu.clc(&mut bus);
+        assert!(!cpu.get_flag(Flag::C));
+    }
+
+    #[test]
+    fn sec_sets_carry() {
+        let (mut cpu, mut bus) = make();
+        cpu.set_flag(Flag::C, false);
+        cpu.sec(&mut bus);
+        assert!(cpu.get_flag(Flag::C));
+    }
+
+    #[test]
+    fn cld_clears_decimal() {
+        let (mut cpu, mut bus) = make();
+        cpu.set_flag(Flag::D, true);
+        cpu.cld(&mut bus);
+        assert!(!cpu.get_flag(Flag::D));
+    }
+
+    #[test]
+    fn sed_sets_decimal() {
+        let (mut cpu, mut bus) = make();
+        cpu.set_flag(Flag::D, false);
+        cpu.sed(&mut bus);
+        assert!(cpu.get_flag(Flag::D));
+    }
+
+    #[test]
+    fn cli_clears_interrupt_disable() {
+        let (mut cpu, mut bus) = make();
+        cpu.set_flag(Flag::I, true);
+        cpu.cli(&mut bus);
+        assert!(!cpu.get_flag(Flag::I));
+    }
+
+    #[test]
+    fn sei_sets_interrupt_disable() {
+        let (mut cpu, mut bus) = make();
+        cpu.set_flag(Flag::I, false);
+        cpu.sei(&mut bus);
+        assert!(cpu.get_flag(Flag::I));
+    }
+
+    #[test]
+    fn clv_clears_overflow() {
+        let (mut cpu, mut bus) = make();
+        cpu.set_flag(Flag::V, true);
+        cpu.clv(&mut bus);
+        assert!(!cpu.get_flag(Flag::V));
+    }
+
+    #[test]
+    fn flag_ops_dont_touch_other_flags() {
+        let (mut cpu, mut bus) = make();
+        cpu.status = 0xFF; // all flags set
+        cpu.clc(&mut bus);
+        // only C cleared, everything else untouched
+        assert_eq!(cpu.status, 0xFF & !(Flag::C as u8));
+    }
+
+    // --- load / store ---
+
+    fn load_setup(val: u8) -> (Cpu, Bus) {
+        let (mut cpu, mut bus) = make();
+        bus.write(0x0042, val);
+        cpu.addr_abs = 0x0042;
+        (cpu, bus)
+    }
+
+    #[test]
+    fn lda_loads_value_into_a() {
+        let (mut cpu, mut bus) = load_setup(0x37);
+        cpu.lda(&mut bus);
+        assert_eq!(cpu.a, 0x37);
+    }
+
+    #[test]
+    fn lda_sets_zero_flag() {
+        let (mut cpu, mut bus) = load_setup(0x00);
+        cpu.lda(&mut bus);
+        assert!(cpu.get_flag(Flag::Z));
+        assert!(!cpu.get_flag(Flag::N));
+    }
+
+    #[test]
+    fn lda_sets_negative_flag() {
+        let (mut cpu, mut bus) = load_setup(0x80);
+        cpu.lda(&mut bus);
+        assert!(cpu.get_flag(Flag::N));
+        assert!(!cpu.get_flag(Flag::Z));
+    }
+
+    #[test]
+    fn lda_returns_1() {
+        let (mut cpu, mut bus) = load_setup(0x01);
+        assert_eq!(cpu.lda(&mut bus), 1);
+    }
+
+    #[test]
+    fn ldx_loads_value_into_x() {
+        let (mut cpu, mut bus) = load_setup(0x55);
+        cpu.ldx(&mut bus);
+        assert_eq!(cpu.x, 0x55);
+    }
+
+    #[test]
+    fn ldx_sets_zero_and_negative_flags() {
+        let (mut cpu, mut bus) = load_setup(0x00);
+        cpu.ldx(&mut bus);
+        assert!(cpu.get_flag(Flag::Z));
+
+        let (mut cpu, mut bus) = load_setup(0xFF);
+        cpu.ldx(&mut bus);
+        assert!(cpu.get_flag(Flag::N));
+    }
+
+    #[test]
+    fn ldy_loads_value_into_y() {
+        let (mut cpu, mut bus) = load_setup(0xAB);
+        cpu.ldy(&mut bus);
+        assert_eq!(cpu.y, 0xAB);
+    }
+
+    #[test]
+    fn ldy_sets_zero_and_negative_flags() {
+        let (mut cpu, mut bus) = load_setup(0x00);
+        cpu.ldy(&mut bus);
+        assert!(cpu.get_flag(Flag::Z));
+
+        let (mut cpu, mut bus) = load_setup(0x80);
+        cpu.ldy(&mut bus);
+        assert!(cpu.get_flag(Flag::N));
+    }
+
+    #[test]
+    fn sta_writes_a_to_addr_abs() {
+        let (mut cpu, mut bus) = make();
+        cpu.a = 0x42;
+        cpu.addr_abs = 0x0300;
+        cpu.sta(&mut bus);
+        assert_eq!(bus.read(0x0300), 0x42);
+    }
+
+    #[test]
+    fn sta_does_not_change_flags() {
+        let (mut cpu, mut bus) = make();
+        cpu.a = 0x00; // would set Z if flags were touched
+        cpu.addr_abs = 0x0300;
+        let status_before = cpu.status;
+        cpu.sta(&mut bus);
+        assert_eq!(cpu.status, status_before);
+    }
+
+    #[test]
+    fn sta_returns_0() {
+        let (mut cpu, mut bus) = make();
+        cpu.addr_abs = 0x0300;
+        assert_eq!(cpu.sta(&mut bus), 0);
+    }
+
+    #[test]
+    fn stx_writes_x_to_addr_abs() {
+        let (mut cpu, mut bus) = make();
+        cpu.x = 0x77;
+        cpu.addr_abs = 0x0300;
+        cpu.stx(&mut bus);
+        assert_eq!(bus.read(0x0300), 0x77);
+    }
+
+    #[test]
+    fn sty_writes_y_to_addr_abs() {
+        let (mut cpu, mut bus) = make();
+        cpu.y = 0xBB;
+        cpu.addr_abs = 0x0300;
+        cpu.sty(&mut bus);
+        assert_eq!(bus.read(0x0300), 0xBB);
+    }
+
+    // --- register transfers ---
+
+    #[test]
+    fn tax_copies_a_to_x() {
+        let (mut cpu, mut bus) = make();
+        cpu.a = 0x42;
+        cpu.tax(&mut bus);
+        assert_eq!(cpu.x, 0x42);
+    }
+
+    #[test]
+    fn tax_sets_n_z_flags() {
+        let (mut cpu, mut bus) = make();
+        cpu.a = 0x00;
+        cpu.tax(&mut bus);
+        assert!(cpu.get_flag(Flag::Z));
+        assert!(!cpu.get_flag(Flag::N));
+
+        cpu.a = 0x80;
+        cpu.tax(&mut bus);
+        assert!(cpu.get_flag(Flag::N));
+        assert!(!cpu.get_flag(Flag::Z));
+    }
+
+    #[test]
+    fn tay_copies_a_to_y() {
+        let (mut cpu, mut bus) = make();
+        cpu.a = 0x55;
+        cpu.tay(&mut bus);
+        assert_eq!(cpu.y, 0x55);
+    }
+
+    #[test]
+    fn tay_sets_n_z_flags() {
+        let (mut cpu, mut bus) = make();
+        cpu.a = 0x00;
+        cpu.tay(&mut bus);
+        assert!(cpu.get_flag(Flag::Z));
+
+        cpu.a = 0xFF;
+        cpu.tay(&mut bus);
+        assert!(cpu.get_flag(Flag::N));
+    }
+
+    #[test]
+    fn txa_copies_x_to_a() {
+        let (mut cpu, mut bus) = make();
+        cpu.x = 0x33;
+        cpu.txa(&mut bus);
+        assert_eq!(cpu.a, 0x33);
+    }
+
+    #[test]
+    fn txa_sets_n_z_flags() {
+        let (mut cpu, mut bus) = make();
+        cpu.x = 0x00;
+        cpu.txa(&mut bus);
+        assert!(cpu.get_flag(Flag::Z));
+
+        cpu.x = 0x90;
+        cpu.txa(&mut bus);
+        assert!(cpu.get_flag(Flag::N));
+    }
+
+    #[test]
+    fn tya_copies_y_to_a() {
+        let (mut cpu, mut bus) = make();
+        cpu.y = 0x77;
+        cpu.tya(&mut bus);
+        assert_eq!(cpu.a, 0x77);
+    }
+
+    #[test]
+    fn tsx_copies_stack_ptr_to_x() {
+        let (mut cpu, mut bus) = make();
+        cpu.stack.ptr = 0xFD;
+        cpu.tsx(&mut bus);
+        assert_eq!(cpu.x, 0xFD);
+    }
+
+    #[test]
+    fn tsx_sets_n_z_flags() {
+        let (mut cpu, mut bus) = make();
+        cpu.stack.ptr = 0x00;
+        cpu.tsx(&mut bus);
+        assert!(cpu.get_flag(Flag::Z));
+
+        cpu.stack.ptr = 0x80;
+        cpu.tsx(&mut bus);
+        assert!(cpu.get_flag(Flag::N));
+    }
+
+    #[test]
+    fn txs_copies_x_to_stack_ptr() {
+        let (mut cpu, mut bus) = make();
+        cpu.x = 0xAB;
+        cpu.txs(&mut bus);
+        assert_eq!(cpu.stack.ptr, 0xAB);
+    }
+
+    #[test]
+    fn txs_does_not_change_flags() {
+        let (mut cpu, mut bus) = make();
+        cpu.x = 0x00; // would set Z if flags were touched
+        let status_before = cpu.status;
+        cpu.txs(&mut bus);
+        assert_eq!(cpu.status, status_before);
+    }
+
+    // --- stack ---
+
+    #[test]
+    fn pha_pushes_a_to_stack() {
+        let (mut cpu, mut bus) = make();
+        cpu.a = 0x42;
+        let sp_before = cpu.stack.ptr;
+        cpu.pha(&mut bus);
+        assert_eq!(bus.read(0x0100 + sp_before as u16), 0x42);
+        assert_eq!(cpu.stack.ptr, sp_before.wrapping_sub(1));
+    }
+
+    #[test]
+    fn pha_does_not_change_flags() {
+        let (mut cpu, mut bus) = make();
+        cpu.a = 0x00;
+        let status_before = cpu.status;
+        cpu.pha(&mut bus);
+        assert_eq!(cpu.status, status_before);
+    }
+
+    #[test]
+    fn php_pushes_status_with_b_and_u_set() {
+        let (mut cpu, mut bus) = make();
+        cpu.status = 0b0000_0000; // all clear
+        let sp_before = cpu.stack.ptr;
+        cpu.php(&mut bus);
+        let pushed = bus.read(0x0100 + sp_before as u16);
+        assert!(pushed & (Flag::B as u8) != 0);
+        assert!(pushed & (Flag::U as u8) != 0);
+    }
+
+    #[test]
+    fn php_does_not_modify_cpu_status() {
+        let (mut cpu, mut bus) = make();
+        cpu.status = 0b0000_0000;
+        cpu.php(&mut bus);
+        assert_eq!(cpu.status, 0b0000_0000);
+    }
+
+    #[test]
+    fn pla_pops_into_a() {
+        let (mut cpu, mut bus) = make();
+        cpu.pha(&mut bus); // push 0 (a is 0 from new())
+        cpu.a = 0xFF; // change A so we can verify it's overwritten
+        bus.write(0x0100 + cpu.stack.ptr.wrapping_add(1) as u16, 0x42);
+        cpu.pla(&mut bus);
+        assert_eq!(cpu.a, 0x42);
+    }
+
+    #[test]
+    fn pla_sets_n_z_flags() {
+        let (mut cpu, mut bus) = make();
+        bus.write(0x0100 + cpu.stack.ptr.wrapping_add(1) as u16, 0x00);
+        cpu.pla(&mut bus);
+        assert!(cpu.get_flag(Flag::Z));
+        assert!(!cpu.get_flag(Flag::N));
+
+        bus.write(0x0100 + cpu.stack.ptr.wrapping_add(1) as u16, 0x80);
+        cpu.pla(&mut bus);
+        assert!(cpu.get_flag(Flag::N));
+        assert!(!cpu.get_flag(Flag::Z));
+    }
+
+    #[test]
+    fn plp_restores_status_clears_b_sets_u() {
+        let (mut cpu, mut bus) = make();
+        cpu.status = 0x00; // clear everything so initial state can't cause a false pass
+        // place value with B set, U clear on the stack
+        bus.write(0x0100 + cpu.stack.ptr.wrapping_add(1) as u16, 0b1101_1111);
+        cpu.plp(&mut bus);
+        assert!(!cpu.get_flag(Flag::B)); // B must be cleared
+        assert!(cpu.get_flag(Flag::U)); // U must be set
+        assert!(cpu.get_flag(Flag::N)); // N was set in pushed byte, must survive
+        assert!(cpu.get_flag(Flag::C)); // C was set in pushed byte, must survive
+    }
+
+    // --- increment / decrement ---
+
+    #[test]
+    fn inx_increments_x() {
+        let (mut cpu, mut bus) = make();
+        cpu.x = 0x41;
+        cpu.inx(&mut bus);
+        assert_eq!(cpu.x, 0x42);
+    }
+
+    #[test]
+    fn inx_wraps_at_ff() {
+        let (mut cpu, mut bus) = make();
+        cpu.x = 0xFF;
+        cpu.inx(&mut bus);
+        assert_eq!(cpu.x, 0x00);
+        assert!(cpu.get_flag(Flag::Z));
+    }
+
+    #[test]
+    fn inx_sets_negative_flag() {
+        let (mut cpu, mut bus) = make();
+        cpu.x = 0x7F;
+        cpu.inx(&mut bus);
+        assert_eq!(cpu.x, 0x80);
+        assert!(cpu.get_flag(Flag::N));
+    }
+
+    #[test]
+    fn iny_increments_y() {
+        let (mut cpu, mut bus) = make();
+        cpu.y = 0x10;
+        cpu.iny(&mut bus);
+        assert_eq!(cpu.y, 0x11);
+    }
+
+    #[test]
+    fn iny_wraps_at_ff() {
+        let (mut cpu, mut bus) = make();
+        cpu.y = 0xFF;
+        cpu.iny(&mut bus);
+        assert_eq!(cpu.y, 0x00);
+        assert!(cpu.get_flag(Flag::Z));
+    }
+
+    #[test]
+    fn dex_decrements_x() {
+        let (mut cpu, mut bus) = make();
+        cpu.x = 0x05;
+        cpu.dex(&mut bus);
+        assert_eq!(cpu.x, 0x04);
+    }
+
+    #[test]
+    fn dex_wraps_at_zero() {
+        let (mut cpu, mut bus) = make();
+        cpu.x = 0x00;
+        cpu.dex(&mut bus);
+        assert_eq!(cpu.x, 0xFF);
+        assert!(cpu.get_flag(Flag::N));
+    }
+
+    #[test]
+    fn dey_decrements_y() {
+        let (mut cpu, mut bus) = make();
+        cpu.y = 0x03;
+        cpu.dey(&mut bus);
+        assert_eq!(cpu.y, 0x02);
+    }
+
+    #[test]
+    fn dey_wraps_at_zero() {
+        let (mut cpu, mut bus) = make();
+        cpu.x = 0x10; // x != 0 so wrong register would give wrong N flag
+        cpu.y = 0x00;
+        cpu.dey(&mut bus);
+        assert_eq!(cpu.y, 0xFF);
+        assert!(cpu.get_flag(Flag::N));
+    }
+
+    #[test]
+    fn dey_sets_zero_flag() {
+        let (mut cpu, mut bus) = make();
+        cpu.y = 0x01;
+        cpu.dey(&mut bus);
+        assert_eq!(cpu.y, 0x00);
+        assert!(cpu.get_flag(Flag::Z));
+    }
+
+    #[test]
+    fn inc_increments_memory() {
+        let (mut cpu, mut bus) = setup(0x0200, &[(0x0042, 0x10)]);
+        cpu.addr_abs = 0x0042;
+        cpu.inc(&mut bus);
+        assert_eq!(bus.read(0x0042), 0x11);
+    }
+
+    #[test]
+    fn inc_wraps_memory_at_ff() {
+        let (mut cpu, mut bus) = setup(0x0200, &[(0x0042, 0xFF)]);
+        cpu.addr_abs = 0x0042;
+        cpu.inc(&mut bus);
+        assert_eq!(bus.read(0x0042), 0x00);
+        assert!(cpu.get_flag(Flag::Z));
+    }
+
+    #[test]
+    fn dec_decrements_memory() {
+        let (mut cpu, mut bus) = setup(0x0200, &[(0x0042, 0x10)]);
+        cpu.addr_abs = 0x0042;
+        cpu.dec(&mut bus);
+        assert_eq!(bus.read(0x0042), 0x0F);
+    }
+
+    #[test]
+    fn dec_wraps_memory_at_zero() {
+        let (mut cpu, mut bus) = setup(0x0200, &[(0x0042, 0x00)]);
+        cpu.addr_abs = 0x0042;
+        cpu.dec(&mut bus);
+        assert_eq!(bus.read(0x0042), 0xFF);
+        assert!(cpu.get_flag(Flag::N));
+    }
+
+    // --- logical ---
+
+    #[test]
+    fn and_ands_into_a() {
+        let (mut cpu, mut bus) = load_setup(0b1010_1010);
+        cpu.a = 0b1111_0000;
+        cpu.and(&mut bus);
+        assert_eq!(cpu.a, 0b1010_0000);
+    }
+
+    #[test]
+    fn and_sets_zero_flag_when_result_zero() {
+        let (mut cpu, mut bus) = load_setup(0b0000_1111);
+        cpu.a = 0b1111_0000;
+        cpu.and(&mut bus);
+        assert!(cpu.get_flag(Flag::Z));
+    }
+
+    #[test]
+    fn and_sets_negative_flag() {
+        let (mut cpu, mut bus) = load_setup(0b1100_0000);
+        cpu.a = 0b1111_1111;
+        cpu.and(&mut bus);
+        assert!(cpu.get_flag(Flag::N));
+    }
+
+    #[test]
+    fn and_returns_1() {
+        let (mut cpu, mut bus) = load_setup(0xFF);
+        assert_eq!(cpu.and(&mut bus), 1);
+    }
+
+    #[test]
+    fn ora_ors_into_a() {
+        let (mut cpu, mut bus) = load_setup(0b0000_1111);
+        cpu.a = 0b1111_0000;
+        cpu.ora(&mut bus);
+        assert_eq!(cpu.a, 0b1111_1111);
+    }
+
+    #[test]
+    fn ora_sets_zero_flag_when_both_zero() {
+        let (mut cpu, mut bus) = load_setup(0x00);
+        cpu.a = 0x00;
+        cpu.ora(&mut bus);
+        assert!(cpu.get_flag(Flag::Z));
+    }
+
+    #[test]
+    fn ora_returns_1() {
+        let (mut cpu, mut bus) = load_setup(0x00);
+        assert_eq!(cpu.ora(&mut bus), 1);
+    }
+
+    #[test]
+    fn eor_xors_into_a() {
+        let (mut cpu, mut bus) = load_setup(0b1010_1010);
+        cpu.a = 0b1111_1111;
+        cpu.eor(&mut bus);
+        assert_eq!(cpu.a, 0b0101_0101);
+    }
+
+    #[test]
+    fn eor_same_value_gives_zero() {
+        let (mut cpu, mut bus) = load_setup(0x42);
+        cpu.a = 0x42;
+        cpu.eor(&mut bus);
+        assert_eq!(cpu.a, 0x00);
+        assert!(cpu.get_flag(Flag::Z));
+    }
+
+    #[test]
+    fn eor_returns_1() {
+        let (mut cpu, mut bus) = load_setup(0x00);
+        assert_eq!(cpu.eor(&mut bus), 1);
+    }
+
+    #[test]
+    fn bit_sets_z_when_a_and_val_is_zero() {
+        let (mut cpu, mut bus) = load_setup(0b0000_1111);
+        cpu.a = 0b1111_0000;
+        cpu.bit(&mut bus);
+        assert!(cpu.get_flag(Flag::Z));
+    }
+
+    #[test]
+    fn bit_sets_n_from_bit7_of_memory_not_result() {
+        let (mut cpu, mut bus) = load_setup(0b1000_0000); // bit 7 set
+        cpu.a = 0b0000_0000; // A & val = 0, but N comes from val
+        cpu.bit(&mut bus);
+        assert!(cpu.get_flag(Flag::N));
+    }
+
+    #[test]
+    fn bit_sets_v_from_bit6_of_memory() {
+        let (mut cpu, mut bus) = load_setup(0b0100_0000); // bit 6 set
+        cpu.a = 0b0000_0000;
+        cpu.bit(&mut bus);
+        assert!(cpu.get_flag(Flag::V));
+    }
+
+    #[test]
+    fn bit_clears_v_when_bit6_clear() {
+        let (mut cpu, mut bus) = load_setup(0b1000_0000); // bit 6 clear
+        cpu.set_flag(Flag::V, true);
+        cpu.bit(&mut bus);
+        assert!(!cpu.get_flag(Flag::V));
+    }
+
+    // --- shifts and rotates ---
+
+    // For imp mode tests, set opcode to a known imp instruction (0xEA = NOP/imp)
+    // so fetch() returns fetched (which imp() set to A) rather than reading memory.
+    fn imp_mode_setup() -> (Cpu, Bus) {
+        let (mut cpu, bus) = make();
+        cpu.opcode = 0xEA; // NOP — imp addressing
+        (cpu, bus)
+    }
+
+    #[test]
+    fn asl_shifts_memory_left() {
+        let (mut cpu, mut bus) = load_setup(0b0100_0010);
+        cpu.asl(&mut bus);
+        assert_eq!(bus.read(0x0042), 0b1000_0100);
+        assert!(!cpu.get_flag(Flag::C));
+    }
+
+    #[test]
+    fn asl_puts_old_bit7_in_carry() {
+        let (mut cpu, mut bus) = load_setup(0b1000_0001);
+        cpu.asl(&mut bus);
+        assert!(cpu.get_flag(Flag::C));
+        assert_eq!(bus.read(0x0042), 0b0000_0010);
+    }
+
+    #[test]
+    fn asl_accumulator_mode() {
+        let (mut cpu, mut bus) = imp_mode_setup();
+        cpu.a = 0b0000_0011;
+        cpu.fetched = cpu.a;
+        cpu.asl(&mut bus);
+        assert_eq!(cpu.a, 0b0000_0110);
+    }
+
+    #[test]
+    fn lsr_shifts_memory_right() {
+        let (mut cpu, mut bus) = load_setup(0b1000_0100);
+        cpu.lsr(&mut bus);
+        assert_eq!(bus.read(0x0042), 0b0100_0010);
+        assert!(!cpu.get_flag(Flag::C));
+        assert!(!cpu.get_flag(Flag::N)); // N always 0 after LSR
+    }
+
+    #[test]
+    fn lsr_puts_old_bit0_in_carry() {
+        let (mut cpu, mut bus) = load_setup(0b0000_0011);
+        cpu.lsr(&mut bus);
+        assert!(cpu.get_flag(Flag::C));
+        assert_eq!(bus.read(0x0042), 0b0000_0001);
+    }
+
+    #[test]
+    fn lsr_accumulator_mode() {
+        let (mut cpu, mut bus) = imp_mode_setup();
+        cpu.a = 0b1000_0000;
+        cpu.fetched = cpu.a;
+        cpu.lsr(&mut bus);
+        assert_eq!(cpu.a, 0b0100_0000);
+        assert!(!cpu.get_flag(Flag::N));
+    }
+
+    #[test]
+    fn rol_rotates_carry_into_bit0() {
+        let (mut cpu, mut bus) = load_setup(0b0000_0001);
+        cpu.set_flag(Flag::C, true);
+        cpu.rol(&mut bus);
+        assert_eq!(bus.read(0x0042), 0b0000_0011); // shifted left + carry in
+        assert!(!cpu.get_flag(Flag::C)); // old bit 7 was 0
+    }
+
+    #[test]
+    fn rol_puts_old_bit7_in_carry() {
+        let (mut cpu, mut bus) = load_setup(0b1000_0000);
+        cpu.set_flag(Flag::C, false);
+        cpu.rol(&mut bus);
+        assert!(cpu.get_flag(Flag::C));
+        assert_eq!(bus.read(0x0042), 0b0000_0000);
+    }
+
+    #[test]
+    fn rol_accumulator_mode() {
+        let (mut cpu, mut bus) = imp_mode_setup();
+        cpu.a = 0b0100_0000;
+        cpu.fetched = cpu.a;
+        cpu.set_flag(Flag::C, true);
+        cpu.rol(&mut bus);
+        assert_eq!(cpu.a, 0b1000_0001);
+    }
+
+    #[test]
+    fn ror_rotates_carry_into_bit7() {
+        let (mut cpu, mut bus) = load_setup(0b0000_0010);
+        cpu.set_flag(Flag::C, true);
+        cpu.ror(&mut bus);
+        assert_eq!(bus.read(0x0042), 0b1000_0001); // carry into bit 7
+        assert!(!cpu.get_flag(Flag::C)); // old bit 0 was 0
+    }
+
+    #[test]
+    fn ror_puts_old_bit0_in_carry() {
+        let (mut cpu, mut bus) = load_setup(0b0000_0001);
+        cpu.set_flag(Flag::C, false);
+        cpu.ror(&mut bus);
+        assert!(cpu.get_flag(Flag::C));
+        assert_eq!(bus.read(0x0042), 0b0000_0000);
+    }
+
+    #[test]
+    fn ror_accumulator_mode() {
+        let (mut cpu, mut bus) = imp_mode_setup();
+        cpu.a = 0b0000_0010;
+        cpu.fetched = cpu.a;
+        cpu.set_flag(Flag::C, true);
+        cpu.ror(&mut bus);
+        assert_eq!(cpu.a, 0b1000_0001);
+    }
+
+    // --- compare ---
+
+    #[test]
+    fn cmp_equal_sets_z_and_c() {
+        let (mut cpu, mut bus) = load_setup(0x42);
+        cpu.a = 0x42;
+        cpu.cmp(&mut bus);
+        assert!(cpu.get_flag(Flag::Z));
+        assert!(cpu.get_flag(Flag::C));
+        assert!(!cpu.get_flag(Flag::N));
+    }
+
+    #[test]
+    fn cmp_greater_sets_c_clears_z() {
+        let (mut cpu, mut bus) = load_setup(0x10);
+        cpu.a = 0x20;
+        cpu.cmp(&mut bus);
+        assert!(cpu.get_flag(Flag::C));
+        assert!(!cpu.get_flag(Flag::Z));
+    }
+
+    #[test]
+    fn cmp_less_clears_c_sets_n() {
+        let (mut cpu, mut bus) = load_setup(0x20);
+        cpu.a = 0x10;
+        cpu.cmp(&mut bus);
+        assert!(!cpu.get_flag(Flag::C));
+        assert!(cpu.get_flag(Flag::N));
+    }
+
+    #[test]
+    fn cmp_n_flag_uses_bit7_not_bit11() {
+        // A=0x7F, mem=0x80 → tmp = 0xFF → bit 7 set → N=1
+        // 0xFF & 0x0800 == 0, so this test would fail with the wrong mask
+        let (mut cpu, mut bus) = load_setup(0x80);
+        cpu.a = 0x7F;
+        cpu.cmp(&mut bus);
+        assert!(cpu.get_flag(Flag::N));
+    }
+
+    #[test]
+    fn cmp_returns_1() {
+        let (mut cpu, mut bus) = load_setup(0x00);
+        assert_eq!(cpu.cmp(&mut bus), 1);
+    }
+
+    #[test]
+    fn cpx_compares_x() {
+        let (mut cpu, mut bus) = load_setup(0x42);
+        cpu.x = 0x42;
+        cpu.cpx(&mut bus);
+        assert!(cpu.get_flag(Flag::Z));
+        assert!(cpu.get_flag(Flag::C));
+    }
+
+    #[test]
+    fn cpx_less_clears_c() {
+        let (mut cpu, mut bus) = load_setup(0x50);
+        cpu.x = 0x30;
+        cpu.cpx(&mut bus);
+        assert!(!cpu.get_flag(Flag::C));
+    }
+
+    #[test]
+    fn cpx_returns_0() {
+        let (mut cpu, mut bus) = load_setup(0x00);
+        assert_eq!(cpu.cpx(&mut bus), 0);
+    }
+
+    #[test]
+    fn cpy_compares_y() {
+        let (mut cpu, mut bus) = load_setup(0x42);
+        cpu.y = 0x42;
+        cpu.cpy(&mut bus);
+        assert!(cpu.get_flag(Flag::Z));
+        assert!(cpu.get_flag(Flag::C));
+    }
+
+    #[test]
+    fn cpy_less_clears_c() {
+        let (mut cpu, mut bus) = load_setup(0x50);
+        cpu.y = 0x30;
+        cpu.cpy(&mut bus);
+        assert!(!cpu.get_flag(Flag::C));
+    }
+
+    #[test]
+    fn cpy_returns_0() {
+        let (mut cpu, mut bus) = load_setup(0x00);
+        assert_eq!(cpu.cpy(&mut bus), 0);
+    }
+
+    // --- adc ---
+
+    #[test]
+    fn adc_basic_no_carry_in() {
+        // 0x10 + 0x20 = 0x30, no carry in, no carry out, no overflow
+        let (mut cpu, mut bus) = load_setup(0x20);
+        cpu.a = 0x10;
+        cpu.set_flag(Flag::C, false);
+        cpu.adc(&mut bus);
+        assert_eq!(cpu.a, 0x30);
+        assert!(!cpu.get_flag(Flag::C));
+        assert!(!cpu.get_flag(Flag::Z));
+        assert!(!cpu.get_flag(Flag::N));
+        assert!(!cpu.get_flag(Flag::V));
+    }
+
+    #[test]
+    fn adc_with_carry_in() {
+        // 0x10 + 0x20 + C=1 = 0x31
+        let (mut cpu, mut bus) = load_setup(0x20);
+        cpu.a = 0x10;
+        cpu.set_flag(Flag::C, true);
+        cpu.adc(&mut bus);
+        assert_eq!(cpu.a, 0x31);
+    }
+
+    #[test]
+    fn adc_sets_carry_on_overflow() {
+        // 0xFF + 0x01 = 0x100, carry out
+        let (mut cpu, mut bus) = load_setup(0x01);
+        cpu.a = 0xFF;
+        cpu.set_flag(Flag::C, false);
+        cpu.adc(&mut bus);
+        assert_eq!(cpu.a, 0x00);
+        assert!(cpu.get_flag(Flag::C));
+        assert!(cpu.get_flag(Flag::Z));
+    }
+
+    #[test]
+    fn adc_sets_z_when_result_zero() {
+        // 0x00 + 0x00 = 0x00
+        let (mut cpu, mut bus) = load_setup(0x00);
+        cpu.a = 0x00;
+        cpu.set_flag(Flag::C, false);
+        cpu.adc(&mut bus);
+        assert!(cpu.get_flag(Flag::Z));
+        assert!(!cpu.get_flag(Flag::N));
+    }
+
+    #[test]
+    fn adc_sets_n_when_result_negative() {
+        // 0x40 + 0x40 = 0x80, bit 7 set → N=1
+        let (mut cpu, mut bus) = load_setup(0x40);
+        cpu.a = 0x40;
+        cpu.set_flag(Flag::C, false);
+        cpu.adc(&mut bus);
+        assert_eq!(cpu.a, 0x80);
+        assert!(cpu.get_flag(Flag::N));
+    }
+
+    #[test]
+    fn adc_sets_v_positive_overflow() {
+        // +64 + +64 = 0x80 (−128 in signed) → signed overflow → V=1
+        let (mut cpu, mut bus) = load_setup(0x40);
+        cpu.a = 0x40;
+        cpu.set_flag(Flag::C, false);
+        cpu.adc(&mut bus);
+        assert!(cpu.get_flag(Flag::V));
+    }
+
+    #[test]
+    fn adc_sets_v_negative_overflow() {
+        // −1 (0xFF) + −1 (0xFF) = 0xFE (−2, no overflow — both negative, result negative)
+        // but −128 (0x80) + −128 (0x80) = 0x00 → signed overflow → V=1
+        let (mut cpu, mut bus) = load_setup(0x80);
+        cpu.a = 0x80;
+        cpu.set_flag(Flag::C, false);
+        cpu.adc(&mut bus);
+        assert!(cpu.get_flag(Flag::V));
+    }
+
+    #[test]
+    fn adc_no_v_when_signs_differ() {
+        // +127 (0x7F) + −1 (0xFF) = 0x7E (+126) — different input signs, never overflow
+        let (mut cpu, mut bus) = load_setup(0xFF);
+        cpu.a = 0x7F;
+        cpu.set_flag(Flag::C, false);
+        cpu.adc(&mut bus);
+        assert_eq!(cpu.a, 0x7E);
+        assert!(!cpu.get_flag(Flag::V));
+    }
+
+    #[test]
+    fn adc_returns_1() {
+        let (mut cpu, mut bus) = load_setup(0x00);
+        assert_eq!(cpu.adc(&mut bus), 1);
+    }
+
+    // --- sbc ---
+
+    #[test]
+    fn sbc_basic_no_borrow() {
+        // 0x30 - 0x10 = 0x20, C=1 (no borrow in), result no borrow out → C=1
+        let (mut cpu, mut bus) = load_setup(0x10);
+        cpu.a = 0x30;
+        cpu.set_flag(Flag::C, true);
+        cpu.sbc(&mut bus);
+        assert_eq!(cpu.a, 0x20);
+        assert!(cpu.get_flag(Flag::C));
+        assert!(!cpu.get_flag(Flag::V));
+    }
+
+    #[test]
+    fn sbc_with_borrow_in() {
+        // 0x30 - 0x10 - borrow(1) = 0x1F
+        let (mut cpu, mut bus) = load_setup(0x10);
+        cpu.a = 0x30;
+        cpu.set_flag(Flag::C, false);
+        cpu.sbc(&mut bus);
+        assert_eq!(cpu.a, 0x1F);
+    }
+
+    #[test]
+    fn sbc_clears_carry_on_borrow() {
+        // 0x10 - 0x20 → borrow, C=0
+        let (mut cpu, mut bus) = load_setup(0x20);
+        cpu.a = 0x10;
+        cpu.set_flag(Flag::C, true);
+        cpu.sbc(&mut bus);
+        assert!(!cpu.get_flag(Flag::C));
+    }
+
+    #[test]
+    fn sbc_sets_z_when_equal() {
+        // 0x42 - 0x42 = 0x00 → Z=1
+        let (mut cpu, mut bus) = load_setup(0x42);
+        cpu.a = 0x42;
+        cpu.set_flag(Flag::C, true);
+        cpu.sbc(&mut bus);
+        assert_eq!(cpu.a, 0x00);
+        assert!(cpu.get_flag(Flag::Z));
+    }
+
+    #[test]
+    fn sbc_sets_v_negative_minus_positive() {
+        // −128 (0x80) - +1 (0x01) = −129, wraps to 0x7F → sign changed → V=1
+        let (mut cpu, mut bus) = load_setup(0x01);
+        cpu.a = 0x80;
+        cpu.set_flag(Flag::C, true);
+        cpu.sbc(&mut bus);
+        assert!(cpu.get_flag(Flag::V));
+    }
+
+    #[test]
+    fn sbc_no_v_when_no_signed_overflow() {
+        // +5 - +3 = +2, no signed overflow
+        let (mut cpu, mut bus) = load_setup(0x03);
+        cpu.a = 0x05;
+        cpu.set_flag(Flag::C, true);
+        cpu.sbc(&mut bus);
+        assert_eq!(cpu.a, 0x02);
+        assert!(!cpu.get_flag(Flag::V));
+    }
+
+    #[test]
+    fn sbc_returns_1() {
+        let (mut cpu, mut bus) = load_setup(0x00);
+        cpu.set_flag(Flag::C, true);
+        assert_eq!(cpu.sbc(&mut bus), 1);
     }
 
     // --- clock ---
