@@ -1,5 +1,3 @@
-use std::sync::atomic::fence;
-
 use crate::bus::Bus;
 
 const NMI_VECTOR: u16 = 0xFFFA;
@@ -116,16 +114,6 @@ impl Cpu {
         let prev = self.pc;
         self.pc = self.pc.wrapping_add(1);
         prev
-    }
-
-    // The CPU never touches memory directly — everything goes through the bus.
-    // These thin delegates keep opcode code readable and hide the bus parameter.
-    fn read(&self, bus: &Bus, addr: u16) -> u8 {
-        bus.read(addr)
-    }
-
-    fn write(&self, bus: &mut Bus, addr: u16, data: u8) {
-        bus.write(addr, data);
     }
 
     // The 6502 has no defined power-on state. reset() is how the CPU gets its
@@ -466,7 +454,15 @@ impl Cpu {
         // V = (~(A ^ fetch()) & (A ^ tmp)) & 0x80  — set when both inputs have same sign but result has different sign
         // A = tmp & 0xFF
         // return 1
-        todo!()
+        let result = (self.a as u16) + (self.fetch(bus) as u16) + self.get_flag(Flag::C) as u16;
+        self.set_flag(Flag::C, result > 0xFF)
+            .set_flag(Flag::Z, result & 0xFF == 0)
+            .set_flag(Flag::N, result & 0x80 != 0);
+        let v = ((!(self.a as u16 ^ self.fetched as u16) & ((self.a as u16) ^ result)) & 0x80) > 0;
+        self.set_flag(Flag::V, v);
+
+        self.a = (result & 0xFF) as u8;
+        1
     }
     fn and(&mut self, bus: &mut Bus) -> u8 {
         // A = A & fetch(); set N, Z; return 1
@@ -494,13 +490,37 @@ impl Cpu {
         self.set_n_z_flags(new_value);
         0
     }
+
+    fn branch(&mut self, cond: bool) {
+        if cond {
+            self.cycles += 1;
+            self.addr_abs = self.pc.wrapping_add(self.addr_rel);
+
+            if self.addr_abs & 0xff00 != (self.pc & 0xff00) {
+                self.cycles += 1;
+            }
+
+            self.pc = self.addr_abs;
+        }
+    }
+
     fn bcc(&mut self, _bus: &mut Bus) -> u8 {
+        // branch if C == 0
+        // if condition: cycles += 1; addr_abs = pc.wrapping_add(addr_rel);
+        //   if (addr_abs & 0xFF00) != (pc & 0xFF00): cycles += 1  (page cross)
+        //   pc = addr_abs
+        // cycles are added directly here, not through the & mechanism; return 0
+        self.branch(!self.get_flag(Flag::C));
         0
     }
     fn bcs(&mut self, _bus: &mut Bus) -> u8 {
+        // branch if C == 1; same pattern as bcc
+        self.branch(self.get_flag(Flag::C));
         0
     }
     fn beq(&mut self, _bus: &mut Bus) -> u8 {
+        // branch if Z == 1; same pattern as bcc
+        self.branch(self.get_flag(Flag::Z));
         0
     }
     fn bit(&mut self, bus: &mut Bus) -> u8 {
@@ -516,21 +536,45 @@ impl Cpu {
         0
     }
     fn bmi(&mut self, _bus: &mut Bus) -> u8 {
+        // branch if N == 1; same pattern as bcc
+        self.branch(self.get_flag(Flag::N));
         0
     }
     fn bne(&mut self, _bus: &mut Bus) -> u8 {
+        // branch if Z == 0; same pattern as bcc
+        self.branch(!self.get_flag(Flag::Z));
         0
     }
     fn bpl(&mut self, _bus: &mut Bus) -> u8 {
+        // branch if N == 0; same pattern as bcc
+        self.branch(!self.get_flag(Flag::N));
         0
     }
-    fn brk(&mut self, _bus: &mut Bus) -> u8 {
+    fn brk(&mut self, bus: &mut Bus) -> u8 {
+        // pc++
+        // push hi(pc); push lo(pc)
+        // set B = 1, U = 1
+        // push status
+        // set I = 1
+        // pc = bus.read_u16(IRQ_VECTOR)
+        // return 0
+        self.pc = self.pc.wrapping_add(1);
+        self.stack.push((self.pc >> 8) as u8, bus);
+        self.stack.push(self.pc as u8, bus);
+        self.set_flag(Flag::B, true).set_flag(Flag::U, true);
+        self.stack.push(self.status, bus);
+        self.set_flag(Flag::I, true);
+        self.pc = bus.read_u16(IRQ_VECTOR);
         0
     }
     fn bvc(&mut self, _bus: &mut Bus) -> u8 {
+        // branch if V == 0; same pattern as bcc
+        self.branch(!self.get_flag(Flag::V));
         0
     }
     fn bvs(&mut self, _bus: &mut Bus) -> u8 {
+        // branch if V == 1; same pattern as bcc
+        self.branch(self.get_flag(Flag::V));
         0
     }
     fn clc(&mut self, _bus: &mut Bus) -> u8 {
@@ -622,9 +666,23 @@ impl Cpu {
         0
     }
     fn jmp(&mut self, _bus: &mut Bus) -> u8 {
+        // pc = addr_abs  (addressing mode already resolved the target — abs or ind)
+        // return 0
+        self.pc = self.addr_abs;
         0
     }
-    fn jsr(&mut self, _bus: &mut Bus) -> u8 {
+    fn jsr(&mut self, bus: &mut Bus) -> u8 {
+        // push hi(pc - 1); push lo(pc - 1)   ← last byte of the JSR instruction
+        // pc = addr_abs
+        // return 0
+        //
+        // Note: by the time jsr() runs, pc already points one past the JSR instruction
+        // (clock() advanced it past the opcode and abs() advanced it past the two address bytes).
+        // The convention is to push pc - 1 so RTS can restore and then add 1 to land correctly.
+        let pc = self.pc.wrapping_sub(1);
+        self.stack.push((pc >> 8) as u8, bus);
+        self.stack.push(pc as u8, bus);
+        self.pc = self.addr_abs;
         0
     }
     fn lda(&mut self, bus: &mut Bus) -> u8 {
@@ -739,10 +797,26 @@ impl Cpu {
         self.set_n_z_flags(new_value);
         0
     }
-    fn rti(&mut self, _bus: &mut Bus) -> u8 {
+    fn rti(&mut self, bus: &mut Bus) -> u8 {
+        // status = stack.pop(); clear B, set U
+        // lo = stack.pop(); hi = stack.pop()
+        // pc = (hi << 8) | lo            ← no +1, interrupt saved the exact return address
+        // return 0
+        self.status = self.stack.pop(bus);
+        self.set_flag(Flag::B, false);
+        self.set_flag(Flag::U, true);
+        let lo = self.stack.pop(bus) as u16;
+        let hi = (self.stack.pop(bus) as u16) << 8;
+        self.pc = hi | lo;
         0
     }
-    fn rts(&mut self, _bus: &mut Bus) -> u8 {
+    fn rts(&mut self, bus: &mut Bus) -> u8 {
+        // lo = stack.pop(); hi = stack.pop()
+        // pc = ((hi << 8) | lo) + 1      ← +1 because JSR pushed pc - 1
+        // return 0
+        let lo = self.stack.pop(bus);
+        let hi = self.stack.pop(bus);
+        self.pc = ((hi as u16) << 8 | lo as u16) + 1;
         0
     }
     fn sbc(&mut self, bus: &mut Bus) -> u8 {
@@ -751,7 +825,18 @@ impl Cpu {
         // same flag logic as ADC (C, Z, N, V), same V formula
         // A = tmp & 0xFF
         // return 1
-        todo!()
+        let result =
+            (self.a as u16) + (self.fetch(bus) ^ 0xff) as u16 + self.get_flag(Flag::C) as u16;
+
+        self.set_flag(Flag::C, result > 0xFF)
+            .set_flag(Flag::Z, result & 0xFF == 0)
+            .set_flag(Flag::N, result & 0x80 != 0);
+        let v = ((!(self.a as u16 ^ (self.fetched ^ 0xff) as u16) & ((self.a as u16) ^ result))
+            & 0x80)
+            > 0;
+        self.set_flag(Flag::V, v);
+        self.a = (result & 0xff) as u8;
+        1
     }
     fn sec(&mut self, _bus: &mut Bus) -> u8 {
         self.set_flag(Flag::C, true);
@@ -2282,6 +2367,301 @@ mod tests {
         let (mut cpu, mut bus) = load_setup(0x00);
         cpu.set_flag(Flag::C, true);
         assert_eq!(cpu.sbc(&mut bus), 1);
+    }
+
+    // --- branches ---
+    //
+    // Branch tests need pc and addr_rel set directly — no full clock() setup needed.
+    // addr_rel is a u16 holding the sign-extended 8-bit offset (set by rel() addressing mode).
+    // Positive offset example: addr_rel = 0x0004  → pc advances forward 4 bytes.
+    // Negative offset example: addr_rel = 0xFFFC  → pc steps back 4 bytes (wraps correctly in u16).
+    //
+    // Three outcomes to test per branch:
+    //   1. condition false  → pc unchanged, cycles unchanged, returns 0
+    //   2. condition true, same page  → pc = pc + addr_rel, cycles += 1, returns 0
+    //   3. condition true, page cross  → pc crosses 0xXX00 boundary, cycles += 2, returns 0
+
+    fn branch_setup(pc: u16, addr_rel: u16) -> (Cpu, Bus) {
+        let (mut cpu, bus) = make();
+        cpu.pc = pc;
+        cpu.addr_rel = addr_rel;
+        (cpu, bus)
+    }
+
+    #[test]
+    fn bcc_not_taken_when_carry_set() {
+        let (mut cpu, mut bus) = branch_setup(0x0200, 0x0010);
+        cpu.set_flag(Flag::C, true);
+        let before_pc = cpu.pc;
+        let before_cycles = cpu.cycles;
+        cpu.bcc(&mut bus);
+        assert_eq!(cpu.pc, before_pc);
+        assert_eq!(cpu.cycles, before_cycles);
+    }
+
+    #[test]
+    fn bcc_taken_same_page() {
+        let (mut cpu, mut bus) = branch_setup(0x0200, 0x0010);
+        cpu.set_flag(Flag::C, false);
+        cpu.cycles = 0;
+        cpu.bcc(&mut bus);
+        assert_eq!(cpu.pc, 0x0210);
+        assert_eq!(cpu.cycles, 1);
+    }
+
+    #[test]
+    fn bcc_taken_page_cross() {
+        // pc=0x02F0 + offset=0x20 = 0x0310 — crosses page boundary (0x02xx → 0x03xx)
+        let (mut cpu, mut bus) = branch_setup(0x02F0, 0x0020);
+        cpu.set_flag(Flag::C, false);
+        cpu.cycles = 0;
+        cpu.bcc(&mut bus);
+        assert_eq!(cpu.pc, 0x0310);
+        assert_eq!(cpu.cycles, 2);
+    }
+
+    #[test]
+    fn bcc_taken_negative_offset() {
+        // addr_rel = 0xFFFC = -4 in sign-extended u16; pc=0x0210 → 0x020C
+        let (mut cpu, mut bus) = branch_setup(0x0210, 0xFFFC);
+        cpu.set_flag(Flag::C, false);
+        cpu.cycles = 0;
+        cpu.bcc(&mut bus);
+        assert_eq!(cpu.pc, 0x020C);
+    }
+
+    #[test]
+    fn bcc_returns_0() {
+        let (mut cpu, mut bus) = branch_setup(0x0200, 0x0010);
+        cpu.set_flag(Flag::C, false);
+        assert_eq!(cpu.bcc(&mut bus), 0);
+    }
+
+    #[test]
+    fn bcs_taken_when_carry_set() {
+        let (mut cpu, mut bus) = branch_setup(0x0200, 0x0010);
+        cpu.set_flag(Flag::C, true);
+        cpu.cycles = 0;
+        cpu.bcs(&mut bus);
+        assert_eq!(cpu.pc, 0x0210);
+        assert_eq!(cpu.cycles, 1);
+    }
+
+    #[test]
+    fn bcs_not_taken_when_carry_clear() {
+        let (mut cpu, mut bus) = branch_setup(0x0200, 0x0010);
+        cpu.set_flag(Flag::C, false);
+        let before_pc = cpu.pc;
+        cpu.bcs(&mut bus);
+        assert_eq!(cpu.pc, before_pc);
+    }
+
+    #[test]
+    fn beq_taken_when_zero_set() {
+        let (mut cpu, mut bus) = branch_setup(0x0200, 0x0008);
+        cpu.set_flag(Flag::Z, true);
+        cpu.cycles = 0;
+        cpu.beq(&mut bus);
+        assert_eq!(cpu.pc, 0x0208);
+        assert_eq!(cpu.cycles, 1);
+    }
+
+    #[test]
+    fn bne_taken_when_zero_clear() {
+        let (mut cpu, mut bus) = branch_setup(0x0200, 0x0008);
+        cpu.set_flag(Flag::Z, false);
+        cpu.cycles = 0;
+        cpu.bne(&mut bus);
+        assert_eq!(cpu.pc, 0x0208);
+        assert_eq!(cpu.cycles, 1);
+    }
+
+    #[test]
+    fn bmi_taken_when_negative_set() {
+        let (mut cpu, mut bus) = branch_setup(0x0200, 0x0004);
+        cpu.set_flag(Flag::N, true);
+        cpu.cycles = 0;
+        cpu.bmi(&mut bus);
+        assert_eq!(cpu.pc, 0x0204);
+        assert_eq!(cpu.cycles, 1);
+    }
+
+    #[test]
+    fn bpl_taken_when_negative_clear() {
+        let (mut cpu, mut bus) = branch_setup(0x0200, 0x0004);
+        cpu.set_flag(Flag::N, false);
+        cpu.cycles = 0;
+        cpu.bpl(&mut bus);
+        assert_eq!(cpu.pc, 0x0204);
+        assert_eq!(cpu.cycles, 1);
+    }
+
+    #[test]
+    fn bvc_taken_when_overflow_clear() {
+        let (mut cpu, mut bus) = branch_setup(0x0200, 0x0006);
+        cpu.set_flag(Flag::V, false);
+        cpu.cycles = 0;
+        cpu.bvc(&mut bus);
+        assert_eq!(cpu.pc, 0x0206);
+        assert_eq!(cpu.cycles, 1);
+    }
+
+    #[test]
+    fn bvs_taken_when_overflow_set() {
+        let (mut cpu, mut bus) = branch_setup(0x0200, 0x0006);
+        cpu.set_flag(Flag::V, true);
+        cpu.cycles = 0;
+        cpu.bvs(&mut bus);
+        assert_eq!(cpu.pc, 0x0206);
+        assert_eq!(cpu.cycles, 1);
+    }
+
+    // --- control flow ---
+
+    // Helper: set up cpu with a known stack pointer and program counter.
+    fn ctrl_setup(pc: u16) -> (Cpu, Bus) {
+        let (mut cpu, bus) = make();
+        cpu.pc = pc;
+        cpu.stack.ptr = 0xFF; // full stack
+        (cpu, bus)
+    }
+
+    // --- jmp ---
+
+    #[test]
+    fn jmp_sets_pc_to_addr_abs() {
+        let (mut cpu, mut bus) = ctrl_setup(0x0300);
+        cpu.addr_abs = 0x1234;
+        cpu.jmp(&mut bus);
+        assert_eq!(cpu.pc, 0x1234);
+    }
+
+    #[test]
+    fn jmp_returns_0() {
+        let (mut cpu, mut bus) = ctrl_setup(0x0300);
+        cpu.addr_abs = 0x1234;
+        assert_eq!(cpu.jmp(&mut bus), 0);
+    }
+
+    // --- jsr / rts ---
+
+    #[test]
+    fn jsr_pushes_pc_minus_1_and_jumps() {
+        // pc = 0x0303 (one past the full 3-byte JSR instruction)
+        // jsr should push 0x0302 (hi=0x03, lo=0x02) and jump to addr_abs
+        let (mut cpu, mut bus) = ctrl_setup(0x0303);
+        cpu.addr_abs = 0x1000;
+        cpu.jsr(&mut bus);
+        assert_eq!(cpu.pc, 0x1000);
+        // stack should hold the return address (pc - 1 = 0x0302)
+        let lo = cpu.stack.pop(&mut bus);
+        let hi = cpu.stack.pop(&mut bus);
+        assert_eq!((hi as u16) << 8 | lo as u16, 0x0302);
+    }
+
+    #[test]
+    fn jsr_returns_0() {
+        let (mut cpu, mut bus) = ctrl_setup(0x0303);
+        cpu.addr_abs = 0x1000;
+        assert_eq!(cpu.jsr(&mut bus), 0);
+    }
+
+    #[test]
+    fn rts_restores_pc_from_stack() {
+        // push return address 0x0302; rts should set pc to 0x0303
+        let (mut cpu, mut bus) = ctrl_setup(0x1000);
+        cpu.stack.push(0x03, &mut bus); // hi
+        cpu.stack.push(0x02, &mut bus); // lo
+        cpu.rts(&mut bus);
+        assert_eq!(cpu.pc, 0x0303);
+    }
+
+    #[test]
+    fn jsr_rts_roundtrip() {
+        let (mut cpu, mut bus) = ctrl_setup(0x0303);
+        cpu.addr_abs = 0x1000;
+        cpu.jsr(&mut bus);
+        assert_eq!(cpu.pc, 0x1000);
+        cpu.rts(&mut bus);
+        assert_eq!(cpu.pc, 0x0303);
+    }
+
+    #[test]
+    fn rts_returns_0() {
+        let (mut cpu, mut bus) = ctrl_setup(0x1000);
+        cpu.stack.push(0x03, &mut bus);
+        cpu.stack.push(0x02, &mut bus);
+        assert_eq!(cpu.rts(&mut bus), 0);
+    }
+
+    // --- rti ---
+
+    #[test]
+    fn rti_restores_status_and_pc() {
+        let (mut cpu, mut bus) = ctrl_setup(0x1000);
+        // push in reverse order: pc hi, pc lo, status
+        cpu.stack.push(0x03, &mut bus); // pc hi
+        cpu.stack.push(0x00, &mut bus); // pc lo
+        cpu.stack.push(0b1100_1111, &mut bus); // status with B set
+        cpu.rti(&mut bus);
+        assert_eq!(cpu.pc, 0x0300);
+        assert!(!cpu.get_flag(Flag::B)); // B cleared
+        assert!(cpu.get_flag(Flag::U)); // U set
+    }
+
+    #[test]
+    fn rti_no_plus_one_on_pc() {
+        // unlike RTS, RTI restores the exact saved address (no +1)
+        let (mut cpu, mut bus) = ctrl_setup(0x1000);
+        cpu.stack.push(0x04, &mut bus); // pc hi
+        cpu.stack.push(0x00, &mut bus); // pc lo
+        cpu.stack.push(0x00, &mut bus); // status
+        cpu.rti(&mut bus);
+        assert_eq!(cpu.pc, 0x0400);
+    }
+
+    #[test]
+    fn rti_returns_0() {
+        let (mut cpu, mut bus) = ctrl_setup(0x1000);
+        cpu.stack.push(0x03, &mut bus);
+        cpu.stack.push(0x00, &mut bus);
+        cpu.stack.push(0x00, &mut bus);
+        assert_eq!(cpu.rti(&mut bus), 0);
+    }
+
+    // --- brk ---
+
+    #[test]
+    fn brk_pushes_pc_and_status_jumps_to_irq_vector() {
+        let (mut cpu, mut bus) = ctrl_setup(0x0201);
+        // set IRQ vector to 0xBEEF
+        bus.write(IRQ_VECTOR, 0xEF);
+        bus.write(IRQ_VECTOR + 1, 0xBE);
+        cpu.status = 0b0000_0000;
+        cpu.brk(&mut bus);
+        assert_eq!(cpu.pc, 0xBEEF);
+        assert!(cpu.get_flag(Flag::I)); // I set
+    }
+
+    #[test]
+    fn brk_pushed_status_has_b_and_u_set() {
+        let (mut cpu, mut bus) = ctrl_setup(0x0201);
+        bus.write(IRQ_VECTOR, 0x00);
+        bus.write(IRQ_VECTOR + 1, 0x10);
+        cpu.status = 0x00;
+        cpu.brk(&mut bus);
+        // stack (top to bottom): status, pc lo, pc hi — pop all three
+        let pushed_status = cpu.stack.pop(&mut bus);
+        assert!(pushed_status & Flag::B as u8 != 0);
+        assert!(pushed_status & Flag::U as u8 != 0);
+    }
+
+    #[test]
+    fn brk_returns_0() {
+        let (mut cpu, mut bus) = ctrl_setup(0x0201);
+        bus.write(IRQ_VECTOR, 0x00);
+        bus.write(IRQ_VECTOR + 1, 0x10);
+        assert_eq!(cpu.brk(&mut bus), 0);
     }
 
     // --- clock ---
