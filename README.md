@@ -54,9 +54,9 @@ Cartridge  ──┘
 | Logical | `AND` `ORA` `EOR` `BIT` | done |
 | Shifts / rotates | `ASL` `LSR` `ROL` `ROR` | done |
 | Compare | `CMP` `CPX` `CPY` | done |
-| Arithmetic | `ADC` `SBC` | in progress |
-| Branches | `BCC` `BCS` `BEQ` `BMI` `BNE` `BPL` `BVC` `BVS` | pending |
-| Control flow | `JMP` `JSR` `RTS` `RTI` `BRK` | pending |
+| Arithmetic | `ADC` `SBC` | done |
+| Branches | `BCC` `BCS` `BEQ` `BMI` `BNE` `BPL` `BVC` `BVS` | done |
+| Control flow | `JMP` `JSR` `RTS` `RTI` `BRK` | done |
 
 ### PPU, APU, Cartridge
 
