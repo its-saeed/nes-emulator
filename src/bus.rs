@@ -9,6 +9,16 @@ impl Bus {
         }
     }
 
+    pub fn load(data: &[u8], start_addr: u16) -> Self {
+        let mut bus = Self {
+            ram: [0; 64 * 1024],
+        };
+
+        let start_addr = start_addr as usize;
+        bus.ram[start_addr..(start_addr + data.len())].copy_from_slice(data);
+        bus
+    }
+
     pub fn read(&self, addr: u16) -> u8 {
         self.ram[addr as usize]
     }
@@ -19,5 +29,10 @@ impl Bus {
 
     pub fn write(&mut self, addr: u16, data: u8) {
         self.ram[addr as usize] = data;
+    }
+
+    pub fn write_u16(&mut self, addr: u16, data: u16) {
+        self.ram[addr as usize] = data as u8;
+        self.ram[(addr + 1) as usize] = (data >> 8) as u8;
     }
 }

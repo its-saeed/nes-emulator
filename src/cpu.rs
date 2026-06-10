@@ -18,7 +18,7 @@ pub enum Flag {
 
 #[derive(Debug, Clone, Copy)]
 pub struct Stack {
-    ptr: u8,
+    pub ptr: u8,
 }
 
 impl Default for Stack {
@@ -45,11 +45,17 @@ impl Stack {
     }
 }
 
+#[derive(Copy, Clone, PartialEq)]
+pub enum AddrMode {
+    Imp, Imm, Zp0, Zpx, Zpy, Abs, Abx, Aby, Ind, Izx, Izy, Rel,
+}
+
 #[derive(Copy, Clone)]
 pub struct Instruction {
     pub name: &'static str,
     pub operate: fn(&mut Cpu, &mut Bus) -> u8,
     pub addr_mode: fn(&mut Cpu, &mut Bus) -> u8,
+    pub addr_mode_type: AddrMode,
     pub cycles: u8,
 }
 
@@ -239,6 +245,32 @@ impl Cpu {
             self.fetched = bus.read(self.addr_abs)
         };
         self.fetched
+    }
+
+    pub fn disassemble(&self, addr: u16, bus: &Bus) -> String {
+        let opcode = bus.read(addr);
+        let inst = self.lookup[opcode as usize];
+        let name = inst.name;
+        let a1 = addr.wrapping_add(1);
+        let a2 = addr.wrapping_add(2);
+        match inst.addr_mode_type {
+            AddrMode::Imp => name.to_string(),
+            AddrMode::Imm => format!("{name} #${:02X}", bus.read(a1)),
+            AddrMode::Zp0 => format!("{name} ${:02X}", bus.read(a1)),
+            AddrMode::Zpx => format!("{name} ${:02X},X", bus.read(a1)),
+            AddrMode::Zpy => format!("{name} ${:02X},Y", bus.read(a1)),
+            AddrMode::Abs => format!("{name} ${:04X}", bus.read_u16(a1)),
+            AddrMode::Abx => format!("{name} ${:04X},X", bus.read_u16(a1)),
+            AddrMode::Aby => format!("{name} ${:04X},Y", bus.read_u16(a1)),
+            AddrMode::Ind => format!("{name} (${:04X})", bus.read_u16(a1)),
+            AddrMode::Izx => format!("{name} (${:02X},X)", bus.read(a1)),
+            AddrMode::Izy => format!("{name} (${:02X}),Y", bus.read(a1)),
+            AddrMode::Rel => {
+                let offset = bus.read(a1) as i8;
+                let target = a2.wrapping_add(offset as u16);
+                format!("{name} ${:04X}", target)
+            }
+        }
     }
 
     fn set_n_z_flags(&mut self, last_result: u8) {
@@ -2696,12 +2728,27 @@ mod tests {
 }
 
 fn build_lookup() -> [Instruction; 256] {
+    macro_rules! am_type {
+        (imp) => { AddrMode::Imp };
+        (imm) => { AddrMode::Imm };
+        (zp0) => { AddrMode::Zp0 };
+        (zpx) => { AddrMode::Zpx };
+        (zpy) => { AddrMode::Zpy };
+        (abs) => { AddrMode::Abs };
+        (abx) => { AddrMode::Abx };
+        (aby) => { AddrMode::Aby };
+        (ind) => { AddrMode::Ind };
+        (izx) => { AddrMode::Izx };
+        (izy) => { AddrMode::Izy };
+        (rel) => { AddrMode::Rel };
+    }
     macro_rules! i {
         ($name:literal, $op:ident, $am:ident, $c:literal) => {
             Instruction {
                 name: $name,
                 operate: Cpu::$op,
                 addr_mode: Cpu::$am,
+                addr_mode_type: am_type!($am),
                 cycles: $c,
             }
         };
