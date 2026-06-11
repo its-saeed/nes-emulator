@@ -47,7 +47,34 @@ impl Stack {
 
 #[derive(Copy, Clone, PartialEq)]
 pub enum AddrMode {
-    Imp, Imm, Zp0, Zpx, Zpy, Abs, Abx, Aby, Ind, Izx, Izy, Rel,
+    Imp,
+    Imm,
+    Zp0,
+    Zpx,
+    Zpy,
+    Abs,
+    Abx,
+    Aby,
+    Ind,
+    Izx,
+    Izy,
+    Rel,
+}
+
+impl AddrMode {
+    pub fn instr_size(self) -> u8 {
+        match self {
+            AddrMode::Imp => 1,
+            AddrMode::Imm
+            | AddrMode::Zp0
+            | AddrMode::Zpx
+            | AddrMode::Zpy
+            | AddrMode::Izx
+            | AddrMode::Izy
+            | AddrMode::Rel => 2,
+            AddrMode::Abs | AddrMode::Abx | AddrMode::Aby | AddrMode::Ind => 3,
+        }
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -57,6 +84,20 @@ pub struct Instruction {
     pub addr_mode: fn(&mut Cpu, &mut Bus) -> u8,
     pub addr_mode_type: AddrMode,
     pub cycles: u8,
+}
+
+pub struct TraceState {
+    pub pc: u16,
+    pub a: u8,
+    pub x: u8,
+    pub y: u8,
+    pub status: u8,
+    pub sp: u8,
+    pub raw_bytes: [u8; 3],       // opcode + up to 2 operand bytes
+    pub instr_len: u8,             // 1, 2, or 3 — how many of raw_bytes are valid
+    pub instr_name: &'static str,
+    pub addr_mode_type: AddrMode,
+    pub total_cycles: u64,
 }
 
 pub struct Cpu {
@@ -73,6 +114,7 @@ pub struct Cpu {
     opcode: u8,
     cycles: u8,
     lookup: [Instruction; 256],
+    total_cycles: u64,
 }
 
 impl Cpu {
@@ -90,6 +132,7 @@ impl Cpu {
             lookup: build_lookup(),
             pc: 0,
             stack: Default::default(),
+            total_cycles: 0,
         }
     }
 
@@ -139,11 +182,12 @@ impl Cpu {
         self.x = 0;
         self.y = 0;
         self.stack.reset();
-        self.status = Flag::U as u8;
+        self.status = Flag::U as u8 | Flag::I as u8;
         self.addr_abs = 0;
         self.addr_rel = 0;
         self.fetched = 0;
-        self.cycles = 8;
+        self.cycles = 7;
+        self.total_cycles = 0;
     }
 
     // Hardware devices (cartridges, mappers) signal the CPU by asserting the IRQ
@@ -195,7 +239,7 @@ impl Cpu {
 
         self.stack.push(self.status, bus);
         self.pc = bus.read_u16(NMI_VECTOR);
-        self.cycles = 8;
+        self.cycles = 7;
     }
 
     // The top-level driver of the CPU. The NES master clock calls this every
@@ -225,6 +269,7 @@ impl Cpu {
             self.set_flag(Flag::U, true);
         }
         self.cycles -= 1;
+        self.total_cycles += 1;
     }
 
     // Before an opcode does its arithmetic it needs one byte of input data.
@@ -271,6 +316,34 @@ impl Cpu {
                 format!("{name} ${:04X}", target)
             }
         }
+    }
+
+    pub fn trace(&self, bus: &Bus) -> Option<TraceState> {
+        if self.cycles != 0 {
+            return None;
+        }
+
+        let opcode = bus.read(self.pc);
+        let inst = self.lookup[opcode as usize];
+        let instr_len = inst.addr_mode_type.instr_size();
+
+        Some(TraceState {
+            pc: self.pc,
+            a: self.a,
+            x: self.x,
+            y: self.y,
+            status: self.status,
+            sp: self.stack.ptr,
+            raw_bytes: [
+                bus.read(self.pc),
+                bus.read(self.pc.wrapping_add(1)),
+                bus.read(self.pc.wrapping_add(2)),
+            ],
+            instr_len,
+            instr_name: inst.name,
+            addr_mode_type: inst.addr_mode_type,
+            total_cycles: self.total_cycles,
+        })
     }
 
     fn set_n_z_flags(&mut self, last_result: u8) {
@@ -1002,10 +1075,10 @@ mod tests {
     }
 
     #[test]
-    fn reset_takes_8_cycles() {
+    fn reset_takes_7_cycles() {
         let (mut cpu, mut bus) = make();
         cpu.reset(&mut bus);
-        assert_eq!(cpu.cycles, 8);
+        assert_eq!(cpu.cycles, 7);
     }
 
     // --- irq ---
@@ -2729,18 +2802,42 @@ mod tests {
 
 fn build_lookup() -> [Instruction; 256] {
     macro_rules! am_type {
-        (imp) => { AddrMode::Imp };
-        (imm) => { AddrMode::Imm };
-        (zp0) => { AddrMode::Zp0 };
-        (zpx) => { AddrMode::Zpx };
-        (zpy) => { AddrMode::Zpy };
-        (abs) => { AddrMode::Abs };
-        (abx) => { AddrMode::Abx };
-        (aby) => { AddrMode::Aby };
-        (ind) => { AddrMode::Ind };
-        (izx) => { AddrMode::Izx };
-        (izy) => { AddrMode::Izy };
-        (rel) => { AddrMode::Rel };
+        (imp) => {
+            AddrMode::Imp
+        };
+        (imm) => {
+            AddrMode::Imm
+        };
+        (zp0) => {
+            AddrMode::Zp0
+        };
+        (zpx) => {
+            AddrMode::Zpx
+        };
+        (zpy) => {
+            AddrMode::Zpy
+        };
+        (abs) => {
+            AddrMode::Abs
+        };
+        (abx) => {
+            AddrMode::Abx
+        };
+        (aby) => {
+            AddrMode::Aby
+        };
+        (ind) => {
+            AddrMode::Ind
+        };
+        (izx) => {
+            AddrMode::Izx
+        };
+        (izy) => {
+            AddrMode::Izy
+        };
+        (rel) => {
+            AddrMode::Rel
+        };
     }
     macro_rules! i {
         ($name:literal, $op:ident, $am:ident, $c:literal) => {
