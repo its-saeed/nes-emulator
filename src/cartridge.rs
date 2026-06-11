@@ -45,7 +45,58 @@ impl Cartridge {
             return Err("invalid magic");
         }
 
-        todo!()
+        let ines_ver = (data[7] >> 2) & 0b11;
+        if ines_ver != 0 {
+            return Err("NES2.0 format is not supported");
+        }
+
+        let mapper1 = data[6];
+        let mapper2 = data[7];
+        let mapper_id = (mapper2 & 0xF0) | (mapper1 >> 4);
+
+        if mapper_id != 0 {
+            return Err("Unsupported mapper");
+        }
+
+        let four_screen = data[6] & 0b1000 != 0;
+        let vertical_mirroring = data[6] & 0b1 != 0;
+        let mirroring = match (four_screen, vertical_mirroring) {
+            (true, _) => Mirroring::FourScreen,
+            (false, true) => Mirroring::Vertical,
+            (false, false) => Mirroring::Horizontal,
+        };
+
+        let prg_banks = data[4];
+        let chr_banks = data[5];
+        let prg_rom_size = prg_banks as usize * PRG_BANK_SIZE;
+        let chr_rom_size = chr_banks as usize * CHR_BANK_SIZE;
+
+        let skip_trainer = data[6] & 0b100 != 0;
+
+        let prg_rom_start = HEADER_SIZE + if skip_trainer { TRAINER_SIZE } else { 0 };
+        let chr_rom_start = prg_rom_start + prg_rom_size;
+
+        let prg_rom_end = prg_rom_start + prg_rom_size;
+        if data.len() < prg_rom_end {
+            return Err("truncated PRG-ROM");
+        }
+        let chr_rom_end = chr_rom_start + chr_rom_size;
+        if chr_rom_size > 0 && data.len() < chr_rom_end {
+            return Err("truncated CHR-ROM");
+        }
+
+        Ok(Self {
+            mirroring,
+            mapper_id,
+            prg_banks,
+            chr_banks,
+            prg_rom: data[prg_rom_start..(prg_rom_start + prg_rom_size)].to_vec(),
+            chr_rom: if chr_rom_size == 0 {
+                vec![0u8; CHR_BANK_SIZE]
+            } else {
+                data[chr_rom_start..(chr_rom_start + chr_rom_size)].to_vec()
+            },
+        })
     }
 
     // CPU bus read — Mapper 0:
@@ -54,7 +105,13 @@ impl Cartridge {
     //   mask = 0x7FFF if prg_banks >= 2 (32 KB, no mirror)
     //   returns None for any address outside 0x8000–0xFFFF
     pub fn cpu_read(&self, addr: u16) -> Option<u8> {
-        todo!()
+        match addr {
+            0x8000..=0xffff => {
+                let mask = if self.prg_banks == 1 { 0x3fff } else { 0x7fff };
+                Some(self.prg_rom[(addr & mask) as usize])
+            }
+            _ => None,
+        }
     }
 
     // CPU bus write — Mapper 0 has no writable PRG; always returns false
@@ -66,7 +123,10 @@ impl Cartridge {
     //   0x0000–0x1FFF → chr_rom[addr]  (works for both CHR-ROM and CHR-RAM)
     //   returns None for any address outside that range
     pub fn ppu_read(&self, addr: u16) -> Option<u8> {
-        todo!()
+        match addr {
+            0x0000..=0x1fff => Some(self.chr_rom[addr as usize]),
+            _ => None,
+        }
     }
 
     // PPU bus write:
@@ -74,7 +134,17 @@ impl Cartridge {
     //   0x0000–0x1FFF → chr_rom[addr] = data; return true
     //   returns false if CHR-ROM (read-only) or address out of range
     pub fn ppu_write(&mut self, addr: u16, data: u8) -> bool {
-        todo!()
+        if self.chr_banks > 0 {
+            return false;
+        }
+
+        match addr {
+            0x0000..=0x1fff => {
+                self.chr_rom[addr as usize] = data;
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -104,12 +174,12 @@ mod tests {
 
         let prg_size = prg_banks as usize * PRG_BANK_SIZE;
         for i in 0..prg_size {
-            data.push((i & 0xFF) as u8);
+            data.push((i >> 8) as u8);
         }
 
         let chr_size = chr_banks as usize * CHR_BANK_SIZE;
         for i in 0..chr_size {
-            data.push((i & 0xFF) as u8);
+            data.push((i >> 8) as u8);
         }
 
         data
@@ -216,8 +286,8 @@ mod tests {
     #[test]
     fn cpu_read_32kb_no_mirror() {
         // 32 KB: upper and lower halves are distinct
-        // 0x8000 & 0x7FFF = 0x0000 → prg_rom[0x0000]
-        // 0xC000 & 0x7FFF = 0x4000 → prg_rom[0x4000]
+        // 0x8000 & 0x7FFF = 0x0000 → prg_rom[0x0000] = 0x00
+        // 0xC000 & 0x7FFF = 0x4000 → prg_rom[0x4000] = 0x40
         let cart = Cartridge::from_bytes(&make_ines(2, 0, 0, false)).unwrap();
         assert_ne!(cart.cpu_read(0x8000), cart.cpu_read(0xC000));
         assert_eq!(cart.cpu_read(0xC000), Some(cart.prg_rom[0x4000]));
