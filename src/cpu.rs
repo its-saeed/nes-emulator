@@ -239,7 +239,7 @@ impl Cpu {
 
         self.stack.push(self.status, bus);
         self.pc = bus.read_u16(NMI_VECTOR);
-        self.cycles = 7;
+        self.cycles = 8;
     }
 
     // The top-level driver of the CPU. The NES master clock calls this every
@@ -1071,7 +1071,7 @@ mod tests {
         bus.write(0xFFFC, 0x00);
         bus.write(0xFFFD, 0x80);
         cpu.reset(&mut bus);
-        assert_eq!(cpu.status, Flag::U as u8);
+        assert_eq!(cpu.status, Flag::U as u8 | Flag::I as u8);
     }
 
     #[test]
@@ -1160,7 +1160,7 @@ mod tests {
     }
 
     #[test]
-    fn nmi_takes_8_cycles() {
+    fn nmi_takes_8_cycles_from_zero_cycles() {
         let (mut cpu, mut bus) = make();
         cpu.nmi(&mut bus);
         assert_eq!(cpu.cycles, 8);
