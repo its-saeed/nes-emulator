@@ -60,9 +60,13 @@ All emulator logic lives in `src/lib.rs` and is fully testable without a window.
 src/
   lib.rs        exports bus, cartridge, and cpu modules
   main.rs       egui/eframe debugger + snake demo
-  bus.rs        64 KB flat address space
+  bus.rs        CPU bus — dispatches to RAM, PPU registers, and cartridge
   cpu.rs        MOS 6502 CPU — registers, flags, instruction table, clock, disassembler
-  cartridge.rs  iNES parser + Mapper 0 (NROM) stubs
+  cartridge.rs  iNES parser + Mapper 0 (NROM)
+tests/
+  roms/
+    nestest.nes   (not committed — download separately)
+    nestest.log   reference output for CPU validation
 docs/
   step-01-cpu-skeleton.md
   step-02-clock-and-addressing.md
@@ -108,7 +112,7 @@ Cartridge  ──┘
 
 | Component | Status |
 |---|---|
-| Cartridge / iNES parser | in progress (Mapper 0 stubs) |
+| Cartridge / iNES parser | done (Mapper 0 / NROM) |
 | PPU | not started |
 | APU | not started |
 
